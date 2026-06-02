@@ -26,25 +26,39 @@ opencode --version
 
 ### Install the Bridge
 
-**Option A: Clone (recommended for now)**
+**Option A: One-liner (auto-downloads latest release)**
 
 ```bash
-git clone https://github.com/edulelis/opencode-mcp.git
-cd opencode-mcp
+bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/scripts/setup.sh)
 ```
 
-**Option B: Direct download**
+This downloads the [latest release](https://github.com/edulelis/opencode-mcp/releases/latest)
+from GitHub, extracts it to `~/.opencode-mcp`, and prints next steps. No npm, no git clone needed.
+
+**Option B: Manual from GitHub release**
 
 ```bash
-mkdir -p ~/opencode-mcp
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/src/index.mjs \
-  -o ~/opencode-mcp/src/index.mjs
+# Download the release zip
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v4.1.0/opencode-mcp-v4.1.0.zip \
+  -o /tmp/opencode-mcp.zip
+unzip /tmp/opencode-mcp.zip -d ~/
+mv ~/opencode-mcp ~/.opencode-mcp
 ```
 
-**Option C: npm (when published)**
+**Option C: Just the server file (smallest download)**
+
+The entire MCP server is one self-contained file:
 
 ```bash
-npx opencode-mcp
+mkdir -p ~/.opencode-mcp/src
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v4.1.0/src/index.mjs \
+  -o ~/.opencode-mcp/src/index.mjs
+```
+
+**Option D: Clone the repo**
+
+```bash
+git clone https://github.com/edulelis/opencode-mcp.git ~/.opencode-mcp
 ```
 
 ### Register with Your MCP Client

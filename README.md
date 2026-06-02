@@ -6,16 +6,45 @@ Use your opencode credentials (DeepSeek, Gemini, MiniMax, Anthropic) from **any*
 
 ---
 
-## Quick Start
+## Install
+
+### One-liner (auto-downloads latest release)
 
 ```bash
-# 1. Install (one command)
 bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/scripts/setup.sh)
+```
 
-# 2. Register in Codex
-codex mcp add opencode-mcp -- node /path/to/opencode-mcp/src/index.mjs
+This downloads the [latest release](https://github.com/edulelis/opencode-mcp/releases/latest), extracts it to `~/.opencode-mcp`, and prints registration instructions.
 
-# 3. Done. Your MCP client now has the "opencode" tool.
+### Manual (just the server file)
+
+If you only want the server file (zero dependencies, single file):
+
+```bash
+mkdir -p ~/opencode-mcp
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v4.1.0/opencode-mcp-v4.1.0.zip \
+  -o /tmp/opencode-mcp.zip
+unzip /tmp/opencode-mcp.zip -d ~/
+```
+
+Or grab just the server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v4.1.0/src/index.mjs \
+  -o ~/opencode-mcp/index.mjs
+```
+
+### Register with your client
+
+```bash
+# Codex
+codex mcp add opencode-mcp -- node ~/.opencode-mcp/src/index.mjs
+
+# Claude Desktop — add to claude_desktop_config.json:
+# { "mcpServers": { "opencode-mcp": {
+#     "command": "node",
+#     "args": ["~/.opencode-mcp/src/index.mjs"]
+# } } }
 ```
 
 ### Requirements
