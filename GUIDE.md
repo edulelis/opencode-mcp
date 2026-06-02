@@ -1,0 +1,187 @@
+# Guide
+
+A walkthrough for humans who want to understand, install, and use `opencode-bridge`.
+
+## What This Solves
+
+You use [opencode](https://opencode.ai) with API keys for DeepSeek, Gemini, and MiniMax. Now you also want to use those same models from:
+
+- **Codex Desktop** (OpenAI's coding app)
+- **Claude Desktop** (Anthropic's app)
+- **Any MCP-compatible tool**
+
+Without `opencode-bridge`, you'd need to configure API keys in each tool separately. With it, you configure once in opencode and the bridge shares those credentials with every MCP client.
+
+## Step-by-Step Installation
+
+### Prerequisites
+
+```bash
+# Install opencode (if not already installed)
+curl -fsSL https://opencode.ai/install | sh
+
+# Verify
+opencode --version
+```
+
+### Install the Bridge
+
+**Option A: Clone (recommended for now)**
+
+```bash
+git clone https://github.com/edulelis/opencode-bridge.git
+cd opencode-bridge
+```
+
+**Option B: Direct download**
+
+```bash
+mkdir -p ~/opencode-bridge
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-bridge/main/src/index.mjs \
+  -o ~/opencode-bridge/src/index.mjs
+```
+
+**Option C: npm (when published)**
+
+```bash
+npx opencode-bridge
+```
+
+### Register with Your MCP Client
+
+**Codex CLI:**
+
+```bash
+codex mcp add opencode-bridge -- node /path/to/opencode-bridge/src/index.mjs
+```
+
+**Codex Desktop** also picks up MCP servers registered via `codex mcp add`.
+
+**Claude Desktop:**
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "opencode-bridge": {
+      "command": "node",
+      "args": ["/path/to/opencode-bridge/src/index.mjs"]
+    }
+  }
+}
+```
+
+### Verify It Works
+
+```bash
+# Test the bridge directly
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"opencode","arguments":{"list":"agents"}}}
+' | node src/index.mjs
+```
+
+You should see the initialize response followed by your agents list.
+
+## Usage Examples
+
+### From Codex Desktop
+
+Once the MCP server is registered, the Codex AI (GPT-5.5 by default) can call the `opencode` tool. You can ask:
+
+> *"Use the ultra agent to review this file"*
+> 
+> *"Ask DeepSeek chat to explain this code"*
+> 
+> *"List my available opencode agents"*
+
+The AI will automatically choose the right tool mode based on your request.
+
+### From Claude Desktop
+
+Same principle — Claude can call `opencode` to delegate tasks to DeepSeek, Gemini, or any opencode agent.
+
+### Direct Tool Calls
+
+If your MCP client supports explicit tool calls, the schema is:
+
+```json
+// Run agent with full directives
+{ "agent": "build", "prompt": "Implement a REST endpoint" }
+
+// Direct model chat
+{ "model": "gemini/gemini-2.5-flash", "prompt": "What's new in ES2025?" }
+
+// List resources
+{ "list": "agents" }
+{ "list": "models" }
+```
+
+## Environment Configuration
+
+The bridge auto-detects most things, but you can override:
+
+```bash
+# Custom opencode binary path
+export OPENCODE_BIN=/opt/homebrew/bin/opencode
+
+# Custom config path
+export OPENCODE_CONFIG=~/.config/opencode/opencode.jsonc
+
+# Debug mode
+export DEBUG=1
+
+# Then start
+node src/index.mjs
+```
+
+## Troubleshooting
+
+### "opencode binary not found"
+
+The bridge searched common locations but couldn't find opencode.
+
+```bash
+# Check if opencode is installed
+which opencode
+
+# If not found, install it
+curl -fsSL https://opencode.ai/install | sh
+
+# Or set explicitly
+export OPENCODE_BIN=$(which opencode)
+```
+
+### Tool call times out (180s)
+
+The model might be slow or the server failed to start.
+
+```bash
+# Check server logs
+export DEBUG=1
+node src/index.mjs
+```
+
+### "API 401" error
+
+The opencode server requires authentication. Ensure `OPENCODE_SERVER_PASSWORD` is set in your environment.
+
+```bash
+# Check if password is set
+echo $OPENCODE_SERVER_PASSWORD
+
+# If empty, generate one
+export OPENCODE_SERVER_PASSWORD=$(openssl rand -hex 16)
+```
+
+### Bridge disconnects immediately
+
+If stdin closes (e.g., when testing with `echo`), the bridge exits. Use `printf` to keep stdin open, or test with a proper MCP client.
+
+## Updating
+
+```bash
+cd /path/to/opencode-bridge
+git pull
+# Restart your MCP client to pick up changes
+```

@@ -1,0 +1,34 @@
+{
+  "name": "opencode-bridge",
+  "version": "4.1.0",
+  "description": "MCP server that bridges Codex app ↔ opencode agents. Use opencode's models, agents, and credentials from any MCP-compatible client.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "opencode-bridge": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "setup": "bash scripts/setup.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edulelis/opencode-bridge.git"
+  },
+  "keywords": [
+    "mcp",
+    "opencode",
+    "codex",
+    "model-context-protocol",
+    "ai",
+    "agents",
+    "deepseek",
+    "gemini",
+    "mcp-server"
+  ],
+  "author": "Eduardo Lelis",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
