@@ -1,109 +1,58 @@
-# Agent Context
-
-This file is for **AI agents** (LLMs reading this repo) to understand how `opencode-mcp` works, how to maintain it, and how to use it.
+# Agent Context for opencode-mcp
 
 ## Identity
 
-You are reading the `opencode-mcp` repository — an MCP server that lets any MCP-compatible client (Codex, Claude Desktop, etc.) call opencode agents and models.
+You are maintaining `opencode-mcp` — an MCP **hub** server. It acts as a single entry point for ALL MCP tools, proxying to child MCP servers defined in `opencode.jsonc`.
 
-## Core Concept
-
-`opencode-mcp` is a **translation layer**:
+## Architecture
 
 ```
-MCP (JSON-RPC over stdio)  ←→  opencode serve HTTP API
+MCP Client (Codex, Claude, etc.)
+        │
+        ▼
+  opencode-mcp (hub)
+        │
+        ├── opencode serve   → agents, models (DeepSeek, Gemini, etc.)
+        ├── codex            → codex, codex-reply tools
+        ├── focus            → dbt_debate, dsp_*, rev_*, agt_*, focus_* tools
+        └── (any MCP from opencode.jsonc's "mcp" section)
 ```
 
-It does NOT contain any AI logic itself. It delegates everything to `opencode serve`, which runs as a headless subprocess.
+The hub reads the `mcp` config from `opencode.jsonc`, starts each enabled MCP server as a subprocess, discovers their tools via `tools/list`, and routes `tools/call` to the right backend.
+
+## Key Components
+
+### `OpencodeHub` class
+- `_ensureOpencode()` — starts `opencode serve` as HTTP backend
+- `_startProxiedMcps()` — spawns child MCP servers from opencode.jsonc's `mcp` section
+- `_waitForMcps()` — waits up to 8s for child MCPs to initialize
+- `_allTools` — merges opencode tool + all proxied MCP tools
+- `_toolBackend` — maps tool names to backend IDs
+
+### `MCPClient` class
+- Wraps a child MCP server subprocess
+- Speaks JSON-RPC 2.0 over stdio
+- `start()` — sends `initialize` + `tools/list` to discover tools
+- `callTool(name, args)` — sends `tools/call` and waits for response
+- `stop()` — sends `shutdown` and kills process
+
+## Tool Routing
+
+The `opencode` tool is handled directly by the hub (routes to opencode serve HTTP API). All other tool names (e.g., `dbt_debate`, `codex`) are looked up in `_toolBackend` and forwarded to the appropriate MCPClient.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.mjs` | **Single-file MCP server**. Zero npm dependencies. |
-| `scripts/setup.sh` | One-command installer for end users |
-| `README.md` | User-facing documentation (start here) |
-| `ARCHITECTURE.md` | Protocol and design details |
-| `GUIDE.md` | Human-friendly walkthrough |
-| `AGENTS.md` | **This file** — context for AI agents |
-| `CONTRIBUTING.md` | Contribution guidelines |
+| `src/index.mjs` | **Single-file hub** — entire MCP server in one file |
+| `tests/test.mjs` | Test suite (18 tests, quick + full modes) |
+| `.github/workflows/test.yml` | CI on push (Node 18/20/22) |
+| `scripts/setup.sh` | One-command install from GitHub release |
 
-## Tool: `opencode`
+## Design Rules
 
-The bridge exposes exactly one MCP tool: **`opencode`**. It has three modes:
-
-### Mode 1: Agent Execution
-
-```json
-{ "agent": "ultra", "prompt": "task description" }
-```
-
-Creates an opencode session with `agent` set. The opencode server applies the agent's full system prompt, permissions, model config, and fallbacks. The response is the assistant's reply.
-
-**When to use**: The user wants code changes, architecture, review, or any task that benefits from opencode's agent directives.
-
-### Mode 2: Direct Model Chat
-
-```json
-{ "model": "deepseek/deepseek-chat", "prompt": "question" }
-```
-
-Creates an opencode session with `model` set. Bypasses agent directives. Useful when the user explicitly asks for a specific model or wants a raw response.
-
-**When to use**: The user asks "use DeepSeek for this" or wants to chat with a model without agent wrappers.
-
-### Mode 3: Listing
-
-```json
-{ "list": "agents" }
-{ "list": "models" }
-```
-
-Returns available agents or models from opencode.
-
-## Architecture Notes for AI Maintainers
-
-### Session Lifecycle
-
-1. `ensureServer()`: Starts `opencode serve` as a subprocess. Waits for the "listening on" message.
-2. `createSessionAndRun()`: POSTs to `/session`, POSTs a message, polls `GET /session/{id}/message` until stable.
-3. `stopServer()`: Kills the subprocess on shutdown.
-
-### Polling Logic
-
-The bridge polls every 1.5s, waiting for 3 consecutive polls with the same message count. It identifies the assistant's response as the last message whose text differs from the prompt.
-
-### Why no npm dependencies?
-
-The bridge implements MCP JSON-RPC over stdio manually (no SDK). This keeps the install trivial — just `node` and the opencode CLI. No `npm install` needed.
-
-### Agent Schema from opencode.jsonc
-
-Agents are parsed from `opencode.jsonc`. The config file uses JSONC (JSON with comments). The parser strips `//` line comments (only outside strings) and `/* */` block comments.
-
-## Testing
-
-```bash
-# Manual smoke test
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-' | node src/index.mjs
-
-# End-to-end test with a model
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"opencode","arguments":{"agent":"quick","prompt":"say OK"}}}
-' | node src/index.mjs
-```
-
-## Common Issues
-
-- **"opencode binary not found"**: The auto-detection failed. Set `OPENCODE_BIN` explicitly.
-- **"stale response"**: The polling returned old data. Check that `DELETE /session/{id}` cleanup is happening.
-- **"slow first call"**: The server starts lazily on first tool call. Set `DEBUG=1` to see startup timing.
-
-## Design Principles
-
-1. **Zero config** — auto-detect opencode installation
-2. **Zero deps** — pure Node.js, no npm packages needed
-3. **Single file** — the entire server is one self-contained `.mjs` file
-4. **Faithful delegation** — don't interpret or modify AI responses; pass them through
+1. **Single MCP registration** — the user registers ONE MCP in their client
+2. **Zero deps** — pure Node.js, no npm install needed
+3. **Auto-discovery** — reads `mcp` from opencode.jsonc automatically
+4. **Graceful degradation** — if a child MCP fails to start, log and skip
+5. **All tools merged** — `tools/list` returns union of all backends

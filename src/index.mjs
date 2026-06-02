@@ -1,206 +1,272 @@
 #!/usr/bin/env node
 
 /**
- * opencode-mcp — MCP server that bridges Codex ↔ opencode.
+ * opencode-mcp — MCP hub that bridges Codex ↔ opencode + all its MCP servers.
  *
- * Exposes a single "opencode" tool that lets MCP clients (Codex, Claude Desktop,
- * any MCP host) call opencode agents and models using credentials already
- * configured in opencode — no duplicate API keys needed.
+ * Reads the `mcp` section from opencode.jsonc, starts every enabled MCP server
+ * (e.g. focus, codex), merges their tools, and also exposes the "opencode" tool
+ * for calling opencode agents and models directly.
  *
- * ── Install ─────────────────────────────────────────────────────────────────
- *   npx opencode-mcp                  # if published to npm
- *   node src/index.mjs                   # local run
+ * Register ONE MCP in Codex — get ALL tools:
  *   codex mcp add opencode-mcp -- node /path/to/src/index.mjs
  *
  * ── Env ────────────────────────────────────────────────────────────────────
- *   OPENCODE_BIN     path to opencode binary             (default: auto-detect)
- *   OPENCODE_CONFIG  path to opencode.jsonc              (default: auto-detect)
- *   OPENCODE_SERVER_PASSWORD  password for opencode serve (default: env value)
- *   OPENCODE_BRIDGE_PORT      force a specific port       (default: random)
+ *   OPENCODE_BIN     path to opencode binary        (default: auto-detect)
+ *   OPENCODE_CONFIG  path to opencode.jsonc         (default: auto-detect)
+ *   OPENCODE_SERVER_PASSWORD  for opencode serve    (default: env value)
+ *   OPENCODE_MCP_SKIP         comma-sep MCP names   (default: none)
  *   DEBUG                      set "1" for verbose logs
- *
- * ── Protocol ────────────────────────────────────────────────────────────────
- * Implements MCP (Model Context Protocol) via stdio JSON-RPC 2.0.
- * Starts `opencode serve` as a headless subprocess and uses its HTTP API.
  */
 
-// ─── Imports ───────────────────────────────────────────────────────────────
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { spawn, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-// ─── Helpers: paths ────────────────────────────────────────────────────────
+// ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
   if (process.env.OPENCODE_BIN && existsSync(process.env.OPENCODE_BIN)) return process.env.OPENCODE_BIN;
-  // Common locations
-  const candidates = [
+  for (const p of [
     join(homedir(), ".opencode", "bin", "opencode"),
     join(homedir(), ".local", "bin", "opencode"),
     "/usr/local/bin/opencode",
     "/opt/homebrew/bin/opencode",
-  ];
-  for (const p of candidates) if (existsSync(p)) return p;
-  // Try PATH
-  try { const p = execSync("which opencode 2>/dev/null", { encoding: "utf-8" }).trim(); if (p) return p; } catch {}
-  return null;
+  ]) if (existsSync(p)) return p;
+  try { return execSync("which opencode 2>/dev/null", { encoding: "utf-8" }).trim(); } catch { return null; }
 }
 
 function findConfig() {
   if (process.env.OPENCODE_CONFIG && existsSync(process.env.OPENCODE_CONFIG)) return process.env.OPENCODE_CONFIG;
-  const candidates = [
+  for (const p of [
     join(homedir(), ".config", "opencode", "opencode.jsonc"),
     join(homedir(), ".config", "opencode", "opencode.json"),
-  ];
-  for (const p of candidates) if (existsSync(p)) return p;
+  ]) if (existsSync(p)) return p;
   return null;
+}
+
+function loadJSONC(filePath) {
+  try {
+    const raw = readFileSync(filePath, "utf-8");
+    const cleaned = raw.split("\n").map(line => {
+      let s = false, c = null;
+      for (let i = 0; i < line.length - 1; i++) {
+        const ch = line[i], p = i > 0 ? line[i - 1] : null;
+        if (s) { if (ch === c && p !== "\\") s = false; continue; }
+        if (ch === '"' || ch === "'") { s = true; c = ch; continue; }
+        if (ch === "/" && line[i + 1] === "/") return line.slice(0, i);
+      }
+      return line;
+    }).join("\n").replace(/\/\*[\s\S]*?\*\//g, "").trim();
+    return JSON.parse(cleaned);
+  } catch (e) { if (IS_DEBUG) console.error("[obridge] Config parse error:", e.message); return {}; }
 }
 
 const OPENCODE_BIN = findOpencode();
 const CONFIG_PATH = findConfig();
+const CFG = CONFIG_PATH ? loadJSONC(CONFIG_PATH) : {};
 const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
 const AUTH = "Basic " + Buffer.from("opencode:" + PASSWORD).toString("base64");
+const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
 
-// ─── Load config ───────────────────────────────────────────────────────────
-function loadJSONC(filePath) {
-  try {
-    const raw = readFileSync(filePath, "utf-8");
-    const lines = raw.split("\n");
-    const cleaned = lines.map(line => {
-      let inString = false, char = null;
-      for (let i = 0; i < line.length - 1; i++) {
-        const c = line[i], p = i > 0 ? line[i - 1] : null;
-        if (inString) { if (c === char && p !== "\\") inString = false; continue; }
-        if (c === '"' || c === "'") { inString = true; char = c; continue; }
-        if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
-      }
-      return line;
-    });
-    return JSON.parse(cleaned.join("\n").replace(/\/\*[\s\S]*?\*\//g, "").trim());
-  } catch (e) {
-    if (IS_DEBUG) console.error("[obridge] Config parse error:", e.message);
-    return {};
-  }
-}
-
-const CFG = CONFIG_PATH ? loadJSONC(CONFIG_PATH) : {};
 const AGENTS = CFG.agent
-  ? Object.entries(CFG.agent).map(([n, d]) => ({
-      name: n,
-      description: (d.description || n).split("\n")[0].slice(0, 120),
-      model: d.model || "default",
-    }))
+  ? Object.entries(CFG.agent).map(([n, d]) => ({ name: n, description: (d.description || n).split("\n")[0].slice(0, 120), model: d.model || "default" }))
   : [];
 
-// ─── Bootstrap check ───────────────────────────────────────────────────────
 if (!OPENCODE_BIN) {
-  console.error("❌ opencode binary not found.");
-  console.error("   Install: curl -fsSL https://opencode.ai/install | sh");
-  console.error("   Or set OPENCODE_BIN=/path/to/opencode");
+  console.error("❌ opencode binary not found. Install: curl -fsSL https://opencode.ai/install | sh");
   process.exit(1);
 }
 
-// ─── MCP Server ────────────────────────────────────────────────────────────
-class OpencodeBridge {
-  buffer = "";
-  serverProc = null;
-  serverUrl = null;
-  serverStarting = null;
-
-  get tools() {
-    return [{
-      name: "opencode",
-      description:
-        "Call opencode agents and models from any MCP client.\n\n" +
-        "MODES:\n" +
-        "  1. AGENT — runs an opencode agent with full system prompts & permissions\n" +
-        "     { \"agent\": \"<name>\", \"prompt\": \"...\" }\n" +
-        "  2. CHAT — direct model call bypassing agent directives\n" +
-        "     { \"model\": \"<provider/model>\", \"prompt\": \"...\" }\n" +
-        "  3. LIST — list available agents or models\n" +
-        "     { \"list\": \"agents\" }  or  { \"list\": \"models\" }\n\n" +
-        "Agents: " + (AGENTS.length ? AGENTS.map(a => a.name).join(", ") : "check opencode_config"),
-      inputSchema: {
-        type: "object",
-        properties: {
-          agent: {
-            type: "string",
-            description: "Agent name from opencode config (runs with full directives)",
-            enum: AGENTS.length ? AGENTS.map(a => a.name) : undefined,
-          },
-          model: {
-            type: "string",
-            description: "Model in provider/name format (e.g. deepseek/deepseek-chat). Direct chat, no agent directives.",
-          },
-          prompt: {
-            type: "string",
-            description: "The prompt or task to execute",
-          },
-          list: {
-            type: "string",
-            description: "Set to \"agents\" or \"models\" to list available resources",
-            enum: ["agents", "models"],
-          },
-          directory: {
-            type: "string",
-            description: "Working directory (defaults to CWD)",
-          },
-        },
-      },
-    }];
+// ─── MCP Client — proxies a child MCP server ───────────────────────────────
+class MCPClient {
+  constructor(name, command, args, env) {
+    this.name = name;
+    this.command = command;
+    this.args = args || [];
+    this.env = env || {};
+    this.proc = null;
+    this.tools = [];
+    this.rpcId = 0;
+    this.pending = new Map();
+    this.buffer = "";
+    this.ready = false;
+    this.failed = false;
   }
 
-  // ── Server lifecycle ──────────────────────────────────────────────
+  async start() {
+    return new Promise((resolve) => {
+      try {
+        const proc = spawn(this.command, this.args, {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, ...this.env },
+        });
+        this.proc = proc;
 
-  ensureServer() {
-    if (this.serverUrl) return Promise.resolve();
-    if (this.serverStarting) return this.serverStarting;
+        let initResolved = false;
 
-    if (IS_DEBUG) console.error("[obridge] Starting opencode serve...");
-    this.serverStarting = new Promise((resolve, reject) => {
-      const args = ["serve", "--port=0", "--hostname=127.0.0.1"];
-      const proc = spawn(OPENCODE_BIN, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, FORCE_COLOR: "0" },
+        proc.stdout.on("data", (chunk) => {
+          this.buffer += chunk.toString();
+          const lines = this.buffer.split("\n");
+          this.buffer = lines.pop();
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+              const msg = JSON.parse(t);
+              this._handleMessage(msg);
+            } catch {}
+          }
+        });
+
+        proc.stderr.on("data", () => {}); // ignore stderr
+        proc.on("error", (err) => {
+          this.failed = true;
+          if (!initResolved) { initResolved = true; resolve(); }
+        });
+        proc.on("exit", () => {
+          if (!initResolved) { this.failed = true; initResolved = true; resolve(); }
+        });
+
+        // Send initialize
+        this._send({ jsonrpc: "2.0", id: this._nextId(), method: "initialize", params: {
+          protocolVersion: "2024-11-05", capabilities: {},
+          clientInfo: { name: "opencode-mcp-hub", version: "5.0.0" },
+        }});
+
+        // Wait for initialize response, then list tools
+        const timeout = setTimeout(() => {
+          if (!initResolved) { initResolved = true; this.failed = true; resolve(); }
+        }, 10000);
+
+        // Override _handleMessage temporarily to catch init
+        const origHandler = this._handleMessage.bind(this);
+        this._handleMessage = (msg) => {
+          if (msg.id === 1 && msg.result) {
+            // Init done — now list tools
+            this._send({ jsonrpc: "2.0", id: this._nextId(), method: "tools/list", params: {} });
+          }
+          if (msg.id === 2 && msg.result) {
+            this.tools = msg.result.tools || [];
+            this.ready = true;
+            this.failed = false;
+            clearTimeout(timeout);
+            initResolved = true;
+            this._handleMessage = origHandler;
+            // Re-process any buffered messages
+            resolve();
+          }
+          origHandler(msg);
+        };
+
+      } catch (err) {
+        this.failed = true;
+        resolve();
+      }
+    });
+  }
+
+  _nextId() { return ++this.rpcId; }
+
+  _send(msg) {
+    if (this.proc?.stdin?.writable) {
+      this.proc.stdin.write(JSON.stringify(msg) + "\n");
+    }
+  }
+
+  _handleMessage(msg) {
+    // Resolve pending calls
+    const pending = this.pending.get(msg.id);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pending.delete(msg.id);
+      pending.resolve(msg);
+    }
+  }
+
+  async callTool(name, args) {
+    const id = this._nextId();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timeout calling ${this.name} tool "${name}"`));
+      }, 120_000);
+
+      this.pending.set(id, { resolve, reject, timeout });
+      this._send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+    });
+  }
+
+  stop() {
+    try {
+      this._send({ jsonrpc: "2.0", id: this._nextId(), method: "shutdown", params: {} });
+      setTimeout(() => this.proc?.kill(), 1000);
+    } catch {}
+  }
+}
+
+// ─── Hub: collects tools from opencode + all child MCPs ────────────────────
+class OpencodeHub {
+  constructor() {
+    this.buffer = "";
+    this._stdinEnded = false;
+
+    // Opencode backend
+    this._openServerProc = null;
+    this._openServerUrl = null;
+    this._openServerStarting = null;
+
+    // Proxied MCP backends
+    this._mcpClients = []; // MCPClient[]
+    this._toolBackend = {}; // toolName -> 'opencode' | 'mcp:<name>'
+    this._hubReady = false;
+  }
+
+  // ── Backend: opencode serve ───────────────────────────────────────
+
+  async _ensureOpencode() {
+    if (this._openServerUrl) return;
+    if (this._openServerStarting) return this._openServerStarting;
+
+    log("Starting opencode serve...");
+    this._openServerStarting = new Promise((resolve, reject) => {
+      const proc = spawn(OPENCODE_BIN, ["serve", "--port=0", "--hostname=127.0.0.1"], {
+        stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, FORCE_COLOR: "0" },
       });
-
       let out = "";
       const onData = (chunk) => {
-        if (this.serverUrl) return;
+        if (this._openServerUrl) return;
         out += chunk.toString();
         const m = out.match(/opencode server listening on (https?:\/\/[^\s]+)/);
         if (m) {
-          this.serverUrl = m[1];
-          this.serverProc = proc;
-          this.serverStarting = null;
-          if (IS_DEBUG) console.error("[obridge] Server ready:", this.serverUrl);
+          this._openServerUrl = m[1];
+          this._openServerProc = proc;
+          this._openServerStarting = null;
+          log("Opencode ready:", this._openServerUrl);
           resolve();
         }
       };
       proc.stdout.on("data", onData);
       proc.stderr.on("data", onData);
-      proc.on("exit", (code) => { if (!this.serverUrl) { this.serverStarting = null; reject(new Error(`Server exit ${code}`)); }});
-      proc.on("error", (e) => { this.serverStarting = null; reject(e); });
-      setTimeout(() => { if (!this.serverUrl) { this.serverStarting = null; reject(new Error("Server start timeout")); }}, 15000);
+      proc.on("exit", (code) => { if (!this._openServerUrl) { this._openServerStarting = null; reject(new Error(`Opencode exit ${code}`)); }});
+      proc.on("error", (e) => { this._openServerStarting = null; reject(e); });
+      setTimeout(() => { if (!this._openServerUrl) { this._openServerStarting = null; reject(new Error("Opencode start timeout")); }}, 15000);
     });
-    return this.serverStarting;
+    return this._openServerStarting;
   }
 
-  stopServer() {
-    if (this.serverProc) { this.serverProc.kill(); this.serverProc = null; }
-    this.serverUrl = null;
+  _stopOpencode() {
+    if (this._openServerProc) { this._openServerProc.kill(); this._openServerProc = null; }
+    this._openServerUrl = null;
   }
 
-  // ── HTTP client ───────────────────────────────────────────────────
-
-  async api(method, path, body) {
-    await this.ensureServer();
-    const resp = await fetch(this.serverUrl + path, {
+  async _api(method, path, body) {
+    await this._ensureOpencode();
+    const resp = await fetch(this._openServerUrl + path, {
       method,
       headers: { "Content-Type": "application/json", Authorization: AUTH },
       body: body ? JSON.stringify(body) : undefined,
@@ -209,134 +275,227 @@ class OpencodeBridge {
     return resp.json();
   }
 
-  extractText(msg) {
-    if (!msg) return "";
-    const parts = msg.parts;
-    if (Array.isArray(parts)) return parts.filter(p => p.type === "text" && p.text).map(p => p.text.trim()).filter(Boolean).join("\n");
-    return msg.content || "";
+  async _opencodeCall(agent, model, prompt, directory) {
+    await this._ensureOpencode();
+    const body = { directory: directory || process.cwd() };
+    if (agent) body.agent = agent;
+    if (model) body.model = model;
+    const session = await this._api("POST", "/session", body);
+    const sid = session.id;
+    await this._api("POST", `/session/${sid}/message`, { parts: [{ type: "text", text: prompt }] });
+    return this._pollSession(sid, prompt);
   }
 
-  // ── Session execution ─────────────────────────────────────────────
-
-  async createSessionAndRun(agentName, modelName, prompt, directory) {
-    await this.ensureServer();
-    const body = { directory: directory || process.cwd() };
-    if (agentName) body.agent = agentName;
-    if (modelName) body.model = modelName;
-
-    const session = await this.api("POST", "/session", body);
-    const sid = session.id;
-    log("Session:", sid);
-
-    await this.api("POST", `/session/${sid}/message`, { parts: [{ type: "text", text: prompt }] });
-    log("Polling...");
-
+  async _pollSession(sid, prompt) {
     const start = Date.now();
-    let prevCount = 0, stable = 0, lastResp = "";
-
+    let prev = 0, stable = 0, last = "";
     await new Promise(r => setTimeout(r, 2000));
-
     while (Date.now() - start < 180000) {
       await new Promise(r => setTimeout(r, 1500));
-      const msgs = await this.api("GET", `/session/${sid}/message`);
+      const msgs = await this._api("GET", `/session/${sid}/message`);
       if (!Array.isArray(msgs)) continue;
-
       let resp = "";
       for (const m of msgs) {
-        const t = this.extractText(m);
+        const parts = m.parts; const t = parts ? parts.filter(p => p.type === "text" && p.text).map(p => p.text.trim()).filter(Boolean).join("\n") : (m.content || "");
         if (t && t !== prompt) resp = t;
       }
-
-      if (msgs.length > prevCount) { prevCount = msgs.length; stable = 0; lastResp = resp; continue; }
-      if (resp && resp === lastResp) { stable++; if (stable >= 3) break; }
-      else if (resp) { lastResp = resp; stable = 0; }
+      if (msgs.length > prev) { prev = msgs.length; stable = 0; last = resp; continue; }
+      if (resp && resp === last) { stable++; if (stable >= 3) break; }
+      else if (resp) { last = resp; stable = 0; }
     }
-
-    try { await this.api("DELETE", `/session/${sid}`); } catch {}
-    return lastResp || "(empty response)";
+    try { await this._api("DELETE", `/session/${sid}`); } catch {}
+    return last || "(empty)";
   }
 
-  // ── JSON-RPC ──────────────────────────────────────────────────────
+  // ── Backend: proxied MCPs ────────────────────────────────────────
+
+  async _startProxiedMcps() {
+    const mcpConfig = CFG.mcp || {};
+    const skipSet = new Set(SKIP_MCPS);
+    const entries = Object.entries(mcpConfig);
+    log(`Proxied MCP config has ${entries.length} entries`);
+    for (const [n] of entries) log(`  mcp entry: ${n}`);
+
+    for (const [name, def] of Object.entries(mcpConfig)) {
+      if (def.enabled === false) continue;
+      if (skipSet.has(name)) { log(`Skipping MCP "${name}" (OPENCODE_MCP_SKIP)`); continue; }
+
+      let cmd, args;
+      if (def.type === "local" && def.command) {
+        cmd = def.command[0];
+        args = def.command.slice(1);
+      } else if (def.type === "remote" && def.url) {
+        log(`Skipping remote MCP "${name}" (${def.url}) — stdio proxy not supported`);
+        continue;
+      } else {
+        continue;
+      }
+
+      // Check if command exists
+      const cmdPath = cmd.includes("/") ? cmd : (() => { try { return execSync(`which ${cmd} 2>/dev/null`, { encoding: "utf-8" }).trim(); } catch { return null; } })();
+      if (!cmdPath && !cmd.includes("/")) {
+        log(`MCP "${name}" command "${cmd}" not found, skipping`);
+        continue;
+      }
+
+      log(`Starting proxied MCP: ${name} (${cmd} ${args.join(" ")})`);
+      const client = new MCPClient(name, cmd, args, def.env || {});
+      await client.start();
+
+      if (client.ready) {
+        this._mcpClients.push(client);
+        for (const tool of client.tools) {
+          this._toolBackend[tool.name] = `mcp:${name}`;
+        }
+        log(`  → ${client.tools.length} tools from "${name}"`);
+      } else {
+        log(`  → MCP "${name}" failed to start, skipping`);
+      }
+    }
+  }
+
+    async _waitForMcps(timeoutMs = 8000) {
+      if (!this._mcpsStarted) {
+        this._mcpsStarted = this._startProxiedMcps();
+      }
+      await Promise.race([
+        this._mcpsStarted,
+        new Promise(r => setTimeout(r, timeoutMs)),
+      ]);
+    }
+
+    // ── Get all tools (opencode + proxied) ───────────────────────────
+
+  get _opencodeTool() {
+    return {
+      name: "opencode",
+      description:
+        "Call opencode agents and models.\n\n" +
+        "MODES:\n" +
+        "  1. AGENT — runs agent with full directives\n" +
+        "     { \"agent\": \"<name>\", \"prompt\": \"...\" }\n" +
+        "  2. CHAT — direct model call\n" +
+        "     { \"model\": \"<provider/model>\", \"prompt\": \"...\" }\n" +
+        "  3. LIST — list agents or models\n" +
+        "     { \"list\": \"agents\" }  or  { \"list\": \"models\" }\n\n" +
+        "Agents: " + (AGENTS.length ? AGENTS.map(a => a.name).join(", ") : "none"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent: { type: "string", description: "Agent name", enum: AGENTS.length ? AGENTS.map(a => a.name) : undefined },
+          model: { type: "string", description: "Model in provider/name format" },
+          prompt: { type: "string", description: "The prompt or task" },
+          list: { type: "string", description: "Set to \"agents\" or \"models\"", enum: ["agents", "models"] },
+          directory: { type: "string", description: "Working directory" },
+        },
+      },
+    };
+  }
+
+  get _allTools() {
+    const tools = [this._opencodeTool];
+    for (const client of this._mcpClients) {
+      for (const t of client.tools) tools.push(t);
+    }
+    return tools;
+  }
+
+  // ── JSON-RPC handlers ─────────────────────────────────────────────
 
   async handle(msg) {
     const { id, method, params } = msg;
+
     switch (method) {
       case "initialize":
-        this.ensureServer().catch(() => {});
+        // Start opencode in background
+        this._ensureOpencode().catch(() => {});
         return this.r(id, {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "opencode-mcp", version: "4.1.0" },
+          serverInfo: { name: "opencode-mcp", version: "5.0.0" },
         });
+
       case "notifications/initialized":
       case "notifications/cancelled":
         return null;
+
       case "tools/list":
-        return this.r(id, { tools: this.tools });
+        await this._waitForMcps();
+        return this.r(id, { tools: this._allTools });
+
       case "tools/call":
-        return this.call(id, params.name, params.arguments || {});
+        await this._waitForMcps();
+        return this._call(id, params.name, params.arguments || {});
+
       case "shutdown":
-        await this.stopServer(); return this.r(id, null);
+        await this._stopAll();
+        return this.r(id, null);
+
       case "exit":
-        await this.stopServer(); process.exit(0);
+        await this._stopAll();
+        process.exit(0);
+
       default:
-        return this.r(id, null, { code: -32601, message: `Unknown method: ${method}` });
+        return this.r(id, null, { code: -32601, message: `Unknown: ${method}` });
     }
   }
 
-  async call(id, name, args) {
+  async _call(id, toolName, args) {
     try {
-      if (name !== "opencode") return this.r(id, null, { code: -32601, message: `Unknown tool: ${name}` });
+      // ── opencode tool ───────────────────────────────────────────
+      if (toolName === "opencode") {
+        const { agent, model, prompt, list, directory } = args;
 
-      const { agent, model, prompt, list, directory } = args;
-
-      // List
-      if (list === "agents") {
-        if (!AGENTS.length) return this.r(id, { content: [{ type: "text", text: "No agents found in opencode config." }] });
-        return this.r(id, {
-          content: [{ type: "text", text:
-            "# Agents\n\n" +
-            AGENTS.map(a => `- **${a.name}**: ${a.description} (model: \`${a.model}\`)`).join("\n") + "\n\n" +
-            `Call: \`{ "agent": "<name>", "prompt": "..." }\``
-          }]
-        });
-      }
-
-      if (list === "models") {
-        try {
-          const out = execSync(`${OPENCODE_BIN} models`, { encoding: "utf-8", timeout: 15000 });
-          return this.r(id, { content: [{ type: "text", text: out }] });
-        } catch (e) {
-          return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, true);
+        if (list === "agents") {
+          if (!AGENTS.length) return this.r(id, { content: [{ type: "text", text: "No agents found." }] });
+          return this.r(id, { content: [{ type: "text", text: "# Agents\n\n" + AGENTS.map(a => `- **${a.name}**: ${a.description} (model: \`${a.model}\`)`).join("\n") + "\n\nCall: `{ \"agent\": \"<name>\", \"prompt\": \"...\" }`" }] });
         }
-      }
-
-      // Validate
-      if (!prompt) return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
-
-      // Run agent
-      if (agent) {
-        if (AGENTS.length && !AGENTS.find(a => a.name === agent)) {
-          return this.r(id, { content: [{ type: "text", text: `Agent "${agent}" not found. Available: ${AGENTS.map(a => a.name).join(", ")}` }] }, true);
+        if (list === "models") {
+          try { const out = execSync(`${OPENCODE_BIN} models`, { encoding: "utf-8", timeout: 15000 }); return this.r(id, { content: [{ type: "text", text: out }] }); }
+          catch (e) { return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, true); }
         }
-        log(`Run agent: ${agent}`);
-        const result = await this.createSessionAndRun(agent, null, prompt, directory);
-        return this.r(id, { content: [{ type: "text", text: result }] });
+        if (!prompt) return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
+        if (agent) {
+          if (AGENTS.length && !AGENTS.find(a => a.name === agent)) return this.r(id, { content: [{ type: "text", text: `Agent "${agent}" not found. Available: ${AGENTS.map(a => a.name).join(", ")}` }] }, true);
+          log(`Run agent: ${agent}`);
+          const result = await this._opencodeCall(agent, null, prompt, directory);
+          return this.r(id, { content: [{ type: "text", text: result }] });
+        }
+        if (model) {
+          log(`Chat model: ${model}`);
+          const result = await this._opencodeCall(null, model, prompt, directory);
+          return this.r(id, { content: [{ type: "text", text: result }] });
+        }
+        return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
       }
 
-      // Direct chat
-      if (model) {
-        log(`Chat model: ${model}`);
-        const result = await this.createSessionAndRun(null, model, prompt, directory);
-        return this.r(id, { content: [{ type: "text", text: result }] });
+      // ── Proxied MCP tool ────────────────────────────────────────
+      const backend = this._toolBackend[toolName];
+      if (backend?.startsWith("mcp:")) {
+        const mcpName = backend.slice(4);
+        const client = this._mcpClients.find(c => c.name === mcpName);
+        if (!client) return this.r(id, null, { code: -32602, message: `Backend "${mcpName}" not available` });
+
+        log(`Forwarding "${toolName}" to MCP "${mcpName}"`);
+        const result = await client.callTool(toolName, args);
+        if (!result) return this.r(id, { content: [{ type: "text", text: `No response from MCP "${mcpName}"` }] }, true);
+        if (result.error) return this.r(id, { content: [{ type: "text", text: `MCP "${mcpName}" error: ${JSON.stringify(result.error)}` }] }, true);
+        return this.r(id, result.result || { content: [{ type: "text", text: "(empty)" }] });
       }
 
-      return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
+      return this.r(id, null, { code: -32601, message: `Unknown tool: ${toolName}` });
 
     } catch (e) {
       log("Error:", e.message);
       return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, true);
     }
+  }
+
+  async _stopAll() {
+    this._stopOpencode();
+    for (const c of this._mcpClients) c.stop();
+    this._mcpClients = [];
+    this._toolBackend = {};
   }
 
   r(id, result, error) {
@@ -345,8 +504,7 @@ class OpencodeBridge {
     return m;
   }
 
-  // ── STDIO transport ───────────────────────────────────────────────
-
+  // ── stdio ─────────────────────────────────────────────────────────
   start() {
     let pending = 0;
     process.stdin.setEncoding("utf-8");
@@ -372,15 +530,20 @@ class OpencodeBridge {
     process.stdin.on("error", () => process.exit(1));
   }
 
-  _exit() { try { this.stopServer(); } catch {} setTimeout(() => process.exit(0), 100); }
+  _exit() { this._stopAll(); setTimeout(() => process.exit(0), 100); }
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────────────
-console.error(`opencode-mcp v4.1.0 — MCP bridge to opencode`);
-console.error(`  opencode: ${OPENCODE_BIN}`);
-console.error(`  config:   ${CONFIG_PATH || "(none)"}`);
-console.error(`  agents:   ${AGENTS.length} found`);
-console.error(`  debug:    ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);
+const mcpList = CFG.mcp ? Object.keys(CFG.mcp).filter(k => CFG.mcp[k].enabled !== false) : [];
+const skipSet = new Set((process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean));
+const activeMcps = mcpList.filter(n => !skipSet.has(n));
+
+console.error(`opencode-mcp v5.0.0 — MCP hub`);
+console.error(`  opencode:    ${OPENCODE_BIN}`);
+console.error(`  agents:      ${AGENTS.length} found`);
+console.error(`  proxied MCPs: ${activeMcps.length > 0 ? activeMcps.join(", ") : "(none)"}`);
+console.error(`  debug:       ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);
 console.error(`Ready. Waiting for MCP messages on stdin...`);
 
-new OpencodeBridge().start();
+const hub = new OpencodeHub();
+hub.start();

@@ -141,7 +141,7 @@ async function run() {
     await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const res = await srv.waitForResponse(2);
 
-    assert(res?.result?.tools?.length === 1, "exactly 1 tool exposed");
+    assert(res?.result?.tools?.length >= 1, "at least 1 tool exposed");
     assert(res?.result?.tools?.[0]?.name === "opencode", 'tool name is "opencode"');
     assert(res?.result?.tools?.[0]?.inputSchema, "tool has inputSchema");
     assert(
