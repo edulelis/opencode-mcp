@@ -11,11 +11,13 @@
  *   codex mcp add opencode-mcp -- node /path/to/src/index.mjs
  *
  * ── Env ────────────────────────────────────────────────────────────────────
- *   OPENCODE_BIN     path to opencode binary        (default: auto-detect)
- *   OPENCODE_CONFIG  path to opencode.jsonc         (default: auto-detect)
- *   OPENCODE_SERVER_PASSWORD  for opencode serve    (default: env value)
- *   OPENCODE_MCP_SKIP         comma-sep MCP names   (default: none)
- *   DEBUG                      set "1" for verbose logs
+ *   OPENCODE_BIN              path to opencode binary        (default: auto-detect)
+ *   OPENCODE_CONFIG           path to opencode.jsonc         (default: auto-detect)
+ *   OPENCODE_SERVER_PASSWORD  for opencode serve             (default: env value)
+ *   OPENCODE_MCP_SKIP         comma-sep MCP names            (default: none)
+ *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
+ *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
+ *   DEBUG                     set "1" for verbose logs
  */
 
 import { homedir } from "node:os";
@@ -72,6 +74,8 @@ const CFG = CONFIG_PATH ? loadJSONC(CONFIG_PATH) : {};
 const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
 const AUTH = "Basic " + Buffer.from("opencode:" + PASSWORD).toString("base64");
 const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
+const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
+const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 
 const AGENTS = CFG.agent
   ? Object.entries(CFG.agent).map(([n, d]) => ({ name: n, description: (d.description || n).split("\n")[0].slice(0, 120), model: d.model || "default" }))
@@ -135,7 +139,7 @@ class MCPClient {
         // Send initialize
         this._send({ jsonrpc: "2.0", id: this._nextId(), method: "initialize", params: {
           protocolVersion: "2024-11-05", capabilities: {},
-          clientInfo: { name: "opencode-mcp-hub", version: "5.0.0" },
+          clientInfo: { name: "opencode-mcp-hub", version: "5.1.0" },
         }});
 
         // Wait for initialize response, then list tools
@@ -193,8 +197,8 @@ class MCPClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Timeout calling ${this.name} tool "${name}"`));
-      }, 120_000);
+        reject(new Error(`Timeout calling ${this.name} tool "${name}" after ${PROXY_TIMEOUT}ms`));
+      }, PROXY_TIMEOUT);
 
       this.pending.set(id, { resolve, reject, timeout });
       this._send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
@@ -264,47 +268,118 @@ class OpencodeHub {
     this._openServerUrl = null;
   }
 
-  async _api(method, path, body) {
+  async _api(method, path, body, queryParams) {
     await this._ensureOpencode();
-    const resp = await fetch(this._openServerUrl + path, {
+    let url = this._openServerUrl + path;
+    if (queryParams) {
+      const qs = new URLSearchParams(queryParams).toString();
+      if (qs) url += "?" + qs;
+    }
+    const resp = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json", Authorization: AUTH },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);
     return resp.json();
+  }
+
+  _parseModel(modelStr) {
+    if (!modelStr) return undefined;
+    const idx = modelStr.indexOf("/");
+    if (idx === -1) return { providerID: modelStr, modelID: modelStr };
+    return { providerID: modelStr.slice(0, idx), modelID: modelStr.slice(idx + 1) };
   }
 
   async _opencodeCall(agent, model, prompt, directory) {
     await this._ensureOpencode();
-    const body = { directory: directory || process.cwd() };
-    if (agent) body.agent = agent;
-    if (model) body.model = model;
-    const session = await this._api("POST", "/session", body);
+    const dir = directory || process.cwd();
+    // Session create: directory goes in query params
+    const session = await this._api("POST", "/session", { title: `opencode-mcp: ${agent || model || "chat"}` }, { directory: dir });
     const sid = session.id;
-    await this._api("POST", `/session/${sid}/message`, { parts: [{ type: "text", text: prompt }] });
+
+    // Message body: agent/model/parts live here per SessionPromptData schema
+    const msgBody = {
+      parts: [{ type: "text", text: prompt }],
+    };
+    if (agent) msgBody.agent = agent;
+    if (model) msgBody.model = this._parseModel(model);
+
+    await this._api("POST", `/session/${sid}/message`, msgBody, { directory: dir });
     return this._pollSession(sid, prompt);
   }
 
   async _pollSession(sid, prompt) {
     const start = Date.now();
-    let prev = 0, stable = 0, last = "";
+    let prev = 0, stable = 0, last = "", lastMsgs = null;
+    log(`Polling session ${sid} (max ${TOOL_TIMEOUT}ms)...`);
     await new Promise(r => setTimeout(r, 2000));
-    while (Date.now() - start < 180000) {
-      await new Promise(r => setTimeout(r, 1500));
-      const msgs = await this._api("GET", `/session/${sid}/message`);
+
+    while (Date.now() - start < TOOL_TIMEOUT) {
+      // Detect if opencode server process died
+      if (this._openServerProc?.exitCode != null) {
+        const msg = `Opencode server exited with code ${this._openServerProc.exitCode}`;
+        log(msg);
+        try { await this._api("DELETE", `/session/${sid}`); } catch {}
+        return `Error: ${msg}`;
+      }
+
+      await new Promise(r => setTimeout(r, 2000));
+
+      let msgs;
+      try {
+        msgs = await this._api("GET", `/session/${sid}/message`);
+      } catch (e) {
+        log(`Poll error: ${e.message}`);
+        continue; // transient, retry
+      }
+
       if (!Array.isArray(msgs)) continue;
+
+      // Check for assistant error on any message
+      for (const m of msgs) {
+        const info = m.info || {};
+        if (info.role === "assistant" && info.error) {
+          const err = info.error;
+          const detail = err.data?.message || err.name || JSON.stringify(err);
+          log(`Assistant error: ${detail}`);
+          try { await this._api("DELETE", `/session/${sid}`); } catch {}
+          return `Error from model: ${detail}`;
+        }
+      }
+
       let resp = "";
       for (const m of msgs) {
-        const parts = m.parts; const t = parts ? parts.filter(p => p.type === "text" && p.text).map(p => p.text.trim()).filter(Boolean).join("\n") : (m.content || "");
+        const parts = m.parts;
+        const t = parts
+          ? parts.filter(p => (p.type === "text" || p.type === "reasoning") && p.text)
+                 .map(p => p.text.trim()).filter(Boolean).join("\n")
+          : (m.content || "");
         if (t && t !== prompt) resp = t;
       }
-      if (msgs.length > prev) { prev = msgs.length; stable = 0; last = resp; continue; }
-      if (resp && resp === last) { stable++; if (stable >= 3) break; }
-      else if (resp) { last = resp; stable = 0; }
+
+      // New messages arrived → reset stability
+      if (msgs.length > prev) { prev = msgs.length; stable = 0; last = resp; lastMsgs = msgs; continue; }
+
+      // Same message count, content stabilized
+      if (resp && resp === last) {
+        stable++;
+        if (stable >= 3) {
+          log(`Session ${sid} stabilized after ${Date.now() - start}ms`);
+          break;
+        }
+      } else if (resp) {
+        last = resp;
+        stable = 0;
+        lastMsgs = msgs;
+      }
     }
+
     try { await this._api("DELETE", `/session/${sid}`); } catch {}
-    return last || "(empty)";
+    const elapsed = Date.now() - start;
+    if (!last) return `(no response after ${(elapsed / 1000).toFixed(0)}s)`;
+    log(`Session ${sid} complete: ${last.length} chars in ${elapsed}ms`);
+    return last;
   }
 
   // ── Backend: proxied MCPs ────────────────────────────────────────
@@ -412,7 +487,7 @@ class OpencodeHub {
         return this.r(id, {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "opencode-mcp", version: "5.0.0" },
+          serverInfo: { name: "opencode-mcp", version: "5.1.0" },
         });
 
       case "notifications/initialized":
@@ -452,11 +527,11 @@ class OpencodeHub {
         }
         if (list === "models") {
           try { const out = execSync(`${OPENCODE_BIN} models`, { encoding: "utf-8", timeout: 15000 }); return this.r(id, { content: [{ type: "text", text: out }] }); }
-          catch (e) { return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, true); }
+          catch (e) { return this.r(id, { content: [{ type: "text", text: `Error listing models: ${e.message}` }] }, `Model list failed: ${e.message}`); }
         }
-        if (!prompt) return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
+        if (!prompt) return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, "Missing prompt");
         if (agent) {
-          if (AGENTS.length && !AGENTS.find(a => a.name === agent)) return this.r(id, { content: [{ type: "text", text: `Agent "${agent}" not found. Available: ${AGENTS.map(a => a.name).join(", ")}` }] }, true);
+          if (AGENTS.length && !AGENTS.find(a => a.name === agent)) return this.r(id, { content: [{ type: "text", text: `Agent "${agent}" not found. Available: ${AGENTS.map(a => a.name).join(", ")}` }] }, `Agent "${agent}" not found`);
           log(`Run agent: ${agent}`);
           const result = await this._opencodeCall(agent, null, prompt, directory);
           return this.r(id, { content: [{ type: "text", text: result }] });
@@ -466,7 +541,7 @@ class OpencodeHub {
           const result = await this._opencodeCall(null, model, prompt, directory);
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
-        return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, true);
+        return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, "Missing agent or model");
       }
 
       // ── Proxied MCP tool ────────────────────────────────────────
@@ -478,8 +553,8 @@ class OpencodeHub {
 
         log(`Forwarding "${toolName}" to MCP "${mcpName}"`);
         const result = await client.callTool(toolName, args);
-        if (!result) return this.r(id, { content: [{ type: "text", text: `No response from MCP "${mcpName}"` }] }, true);
-        if (result.error) return this.r(id, { content: [{ type: "text", text: `MCP "${mcpName}" error: ${JSON.stringify(result.error)}` }] }, true);
+        if (!result) return this.r(id, { content: [{ type: "text", text: `No response from MCP "${mcpName}"` }] }, `MCP "${mcpName}" returned empty`);
+        if (result.error) return this.r(id, { content: [{ type: "text", text: `MCP "${mcpName}" error: ${JSON.stringify(result.error)}` }] }, `MCP "${mcpName}" tool error`);
         return this.r(id, result.result || { content: [{ type: "text", text: "(empty)" }] });
       }
 
@@ -487,7 +562,7 @@ class OpencodeHub {
 
     } catch (e) {
       log("Error:", e.message);
-      return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, true);
+      return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, `Tool call failed: ${e.message}`);
     }
   }
 
@@ -500,7 +575,13 @@ class OpencodeHub {
 
   r(id, result, error) {
     const m = { jsonrpc: "2.0", id };
-    if (error) { m.error = { code: -1, message: "error" }; m.result = result; } else m.result = result;
+    if (error) {
+      const msg = typeof error === "string" ? error : (error?.message || error?.toString?.() || "unknown error");
+      m.error = { code: -1, message: msg };
+      if (result) m.result = result;
+    } else {
+      m.result = result;
+    }
     return m;
   }
 
@@ -533,17 +614,46 @@ class OpencodeHub {
   _exit() { this._stopAll(); setTimeout(() => process.exit(0), 100); }
 }
 
+// ─── Zombie reaper: kill stale opencode serve processes from previous runs ───
+function killStaleOpencode() {
+  try {
+    // Use ps aux for cross-platform (macOS + Linux)
+    const out = execSync(`ps aux | grep "[o]pencode serve" || true`, { encoding: "utf-8" });
+    const lines = out.trim().split("\n").filter(Boolean);
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      const pid = parseInt(parts[1]);
+      if (pid && pid !== process.pid) {
+        try { process.kill(pid, "SIGTERM"); log(`Killed stale opencode serve pid=${pid}`); } catch {}
+      }
+    }
+  } catch {}
+}
+
 // ─── Boot ──────────────────────────────────────────────────────────────────
+killStaleOpencode();
+
 const mcpList = CFG.mcp ? Object.keys(CFG.mcp).filter(k => CFG.mcp[k].enabled !== false) : [];
 const skipSet = new Set((process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean));
 const activeMcps = mcpList.filter(n => !skipSet.has(n));
 
-console.error(`opencode-mcp v5.0.0 — MCP hub`);
-console.error(`  opencode:    ${OPENCODE_BIN}`);
-console.error(`  agents:      ${AGENTS.length} found`);
-console.error(`  proxied MCPs: ${activeMcps.length > 0 ? activeMcps.join(", ") : "(none)"}`);
-console.error(`  debug:       ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);
+console.error(`opencode-mcp v5.1.0 — MCP hub`);
+console.error(`  opencode:      ${OPENCODE_BIN}`);
+console.error(`  agents:        ${AGENTS.length} found`);
+console.error(`  tool timeout:  ${(TOOL_TIMEOUT / 1000).toFixed(0)}s`);
+console.error(`  proxy timeout: ${(PROXY_TIMEOUT / 1000).toFixed(0)}s`);
+console.error(`  proxied MCPs:  ${activeMcps.length > 0 ? activeMcps.join(", ") : "(none)"}`);
+console.error(`  debug:         ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);
 console.error(`Ready. Waiting for MCP messages on stdin...`);
 
 const hub = new OpencodeHub();
 hub.start();
+
+// Clean shutdown on signals
+process.on("SIGTERM", () => { hub._stopAll(); process.exit(0); });
+process.on("SIGINT", () => { hub._stopAll(); process.exit(0); });
+process.on("uncaughtException", (err) => {
+  console.error("[obridge] Uncaught:", err.message);
+  hub._stopAll();
+  process.exit(1);
+});
