@@ -1,6 +1,6 @@
 # Guide
 
-A walkthrough for humans who want to understand, install, and use `opencode-bridge`.
+A walkthrough for humans who want to understand, install, and use `opencode-mcp`.
 
 ## What This Solves
 
@@ -10,7 +10,7 @@ You use [opencode](https://opencode.ai) with API keys for DeepSeek, Gemini, and 
 - **Claude Desktop** (Anthropic's app)
 - **Any MCP-compatible tool**
 
-Without `opencode-bridge`, you'd need to configure API keys in each tool separately. With it, you configure once in opencode and the bridge shares those credentials with every MCP client.
+Without `opencode-mcp`, you'd need to configure API keys in each tool separately. With it, you configure once in opencode and the bridge shares those credentials with every MCP client.
 
 ## Step-by-Step Installation
 
@@ -29,22 +29,22 @@ opencode --version
 **Option A: Clone (recommended for now)**
 
 ```bash
-git clone https://github.com/edulelis/opencode-bridge.git
-cd opencode-bridge
+git clone https://github.com/edulelis/opencode-mcp.git
+cd opencode-mcp
 ```
 
 **Option B: Direct download**
 
 ```bash
-mkdir -p ~/opencode-bridge
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-bridge/main/src/index.mjs \
-  -o ~/opencode-bridge/src/index.mjs
+mkdir -p ~/opencode-mcp
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/src/index.mjs \
+  -o ~/opencode-mcp/src/index.mjs
 ```
 
 **Option C: npm (when published)**
 
 ```bash
-npx opencode-bridge
+npx opencode-mcp
 ```
 
 ### Register with Your MCP Client
@@ -52,7 +52,7 @@ npx opencode-bridge
 **Codex CLI:**
 
 ```bash
-codex mcp add opencode-bridge -- node /path/to/opencode-bridge/src/index.mjs
+codex mcp add opencode-mcp -- node /path/to/opencode-mcp/src/index.mjs
 ```
 
 **Codex Desktop** also picks up MCP servers registered via `codex mcp add`.
@@ -64,9 +64,9 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "opencode-bridge": {
+    "opencode-mcp": {
       "command": "node",
-      "args": ["/path/to/opencode-bridge/src/index.mjs"]
+      "args": ["/path/to/opencode-mcp/src/index.mjs"]
     }
   }
 }
@@ -181,7 +181,7 @@ If stdin closes (e.g., when testing with `echo`), the bridge exits. Use `printf`
 ## Updating
 
 ```bash
-cd /path/to/opencode-bridge
+cd /path/to/opencode-mcp
 git pull
 # Restart your MCP client to pick up changes
 ```

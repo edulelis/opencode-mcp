@@ -1,11 +1,11 @@
 {
-  "name": "opencode-bridge",
+  "name": "opencode-mcp",
   "version": "4.1.0",
   "description": "MCP server that bridges Codex app ↔ opencode agents. Use opencode's models, agents, and credentials from any MCP-compatible client.",
   "type": "module",
   "main": "src/index.mjs",
   "bin": {
-    "opencode-bridge": "src/index.mjs"
+    "opencode-mcp": "src/index.mjs"
   },
   "scripts": {
     "start": "node src/index.mjs",
@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/edulelis/opencode-bridge.git"
+    "url": "git+https://github.com/edulelis/opencode-mcp.git"
   },
   "keywords": [
     "mcp",

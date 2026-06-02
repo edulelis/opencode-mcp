@@ -2,12 +2,12 @@
 
 ## Overview
 
-`opencode-bridge` is a thin MCP (Model Context Protocol) server that translates MCP tool calls into HTTP requests against `opencode serve`.
+`opencode-mcp` is a thin MCP (Model Context Protocol) server that translates MCP tool calls into HTTP requests against `opencode serve`.
 
 ```
 ┌─────────────────────┐     JSON-RPC 2.0      ┌──────────────────┐
 │                     │     over stdio         │                  │
-│   MCP Client        │◄──────────────────────►│  opencode-bridge │
+│   MCP Client        │◄──────────────────────►│  opencode-mcp │
 │   (Codex, Claude,   │                        │  (MCP server)    │
 │    any MCP host)    │                        │                  │
 │                     │                        └────────┬─────────┘

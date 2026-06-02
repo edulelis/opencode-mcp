@@ -1,14 +1,14 @@
 # Agent Context
 
-This file is for **AI agents** (LLMs reading this repo) to understand how `opencode-bridge` works, how to maintain it, and how to use it.
+This file is for **AI agents** (LLMs reading this repo) to understand how `opencode-mcp` works, how to maintain it, and how to use it.
 
 ## Identity
 
-You are reading the `opencode-bridge` repository — an MCP server that lets any MCP-compatible client (Codex, Claude Desktop, etc.) call opencode agents and models.
+You are reading the `opencode-mcp` repository — an MCP server that lets any MCP-compatible client (Codex, Claude Desktop, etc.) call opencode agents and models.
 
 ## Core Concept
 
-`opencode-bridge` is a **translation layer**:
+`opencode-mcp` is a **translation layer**:
 
 ```
 MCP (JSON-RPC over stdio)  ←→  opencode serve HTTP API

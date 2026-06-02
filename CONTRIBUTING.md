@@ -3,8 +3,8 @@
 ## Development
 
 ```bash
-git clone https://github.com/edulelis/opencode-bridge.git
-cd opencode-bridge
+git clone https://github.com/edulelis/opencode-mcp.git
+cd opencode-mcp
 
 # Test directly
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | node src/index.mjs

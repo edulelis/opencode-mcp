@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * opencode-bridge — MCP server that bridges Codex ↔ opencode.
+ * opencode-mcp — MCP server that bridges Codex ↔ opencode.
  *
  * Exposes a single "opencode" tool that lets MCP clients (Codex, Claude Desktop,
  * any MCP host) call opencode agents and models using credentials already
  * configured in opencode — no duplicate API keys needed.
  *
  * ── Install ─────────────────────────────────────────────────────────────────
- *   npx opencode-bridge                  # if published to npm
+ *   npx opencode-mcp                  # if published to npm
  *   node src/index.mjs                   # local run
- *   codex mcp add opencode-bridge -- node /path/to/src/index.mjs
+ *   codex mcp add opencode-mcp -- node /path/to/src/index.mjs
  *
  * ── Env ────────────────────────────────────────────────────────────────────
  *   OPENCODE_BIN     path to opencode binary             (default: auto-detect)
@@ -266,7 +266,7 @@ class OpencodeBridge {
         return this.r(id, {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "opencode-bridge", version: "4.1.0" },
+          serverInfo: { name: "opencode-mcp", version: "4.1.0" },
         });
       case "notifications/initialized":
       case "notifications/cancelled":
@@ -376,7 +376,7 @@ class OpencodeBridge {
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────────────
-console.error(`opencode-bridge v4.1.0 — MCP bridge to opencode`);
+console.error(`opencode-mcp v4.1.0 — MCP bridge to opencode`);
 console.error(`  opencode: ${OPENCODE_BIN}`);
 console.error(`  config:   ${CONFIG_PATH || "(none)"}`);
 console.error(`  agents:   ${AGENTS.length} found`);

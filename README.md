@@ -1,4 +1,4 @@
-# opencode-bridge
+# opencode-mcp
 
 **MCP server** that bridges any MCP-compatible client (Codex, Claude Desktop, etc.) to [opencode](https://opencode.ai) agents and models.
 
@@ -10,10 +10,10 @@ Use your opencode credentials (DeepSeek, Gemini, MiniMax, Anthropic) from **any*
 
 ```bash
 # 1. Install (one command)
-bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-bridge/main/scripts/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/scripts/setup.sh)
 
 # 2. Register in Codex
-codex mcp add opencode-bridge -- node /path/to/opencode-bridge/src/index.mjs
+codex mcp add opencode-mcp -- node /path/to/opencode-mcp/src/index.mjs
 
 # 3. Done. Your MCP client now has the "opencode" tool.
 ```
@@ -65,7 +65,7 @@ Calls any model directly. Useful when you want a raw model response without agen
 ### Codex (OpenAI)
 
 ```bash
-codex mcp add opencode-bridge -- node /path/to/opencode-bridge/src/index.mjs
+codex mcp add opencode-mcp -- node /path/to/opencode-mcp/src/index.mjs
 ```
 
 ### Claude Desktop
@@ -75,9 +75,9 @@ Add to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "opencode-bridge": {
+    "opencode-mcp": {
       "command": "node",
-      "args": ["/path/to/opencode-bridge/src/index.mjs"]
+      "args": ["/path/to/opencode-mcp/src/index.mjs"]
     }
   }
 }
@@ -104,7 +104,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 
 ```
 MCP Client (Codex, Claude, etc.)
-  ──[JSON-RPC over stdio]──> opencode-bridge (MCP server)
+  ──[JSON-RPC over stdio]──> opencode-mcp (MCP server)
                                   │
                                   ├── starts `opencode serve` (headless subprocess)
                                   ├── creates session with agent/model
@@ -126,7 +126,7 @@ If you use **opencode** with multiple AI providers (DeepSeek, Gemini, MiniMax, A
 ## Project Structure
 
 ```
-opencode-bridge/
+opencode-mcp/
 ├── src/index.mjs         MCP server (single file, zero deps)
 ├── scripts/setup.sh      One-command installer
 ├── ARCHITECTURE.md       Protocol & design docs

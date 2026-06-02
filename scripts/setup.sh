@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="edulelis/opencode-bridge"
+REPO="edulelis/opencode-mcp"
 BRANCH="main"
-INSTALL_DIR="${OPENCODE_BRIDGE_DIR:-$HOME/.opencode-bridge}"
+INSTALL_DIR="${OPENCODE_BRIDGE_DIR:-$HOME/.opencode-mcp}"
 
-echo "==> opencode-bridge installer"
+echo "==> opencode-mcp installer"
 echo "    Installing to: $INSTALL_DIR"
 
 # Check dependencies
@@ -42,7 +42,7 @@ echo ""
 echo "==> Installation complete!"
 echo ""
 echo "    Register with Codex:"
-echo "      codex mcp add opencode-bridge -- node $INSTALL_DIR/src/index.mjs"
+echo "      codex mcp add opencode-mcp -- node $INSTALL_DIR/src/index.mjs"
 echo ""
 echo "    Or run directly:"
 echo "      node $INSTALL_DIR/src/index.mjs"
