@@ -62,7 +62,7 @@ function fixture({ opencode = true, mcps = false } = {}) {
 
   if (opencode) {
     writeFileSync(opencodePath, `#!/usr/bin/env node
-import http from "node:http";
+const http = require("node:http");
 
 const models = [
   "deepseek/deepseek-chat",
