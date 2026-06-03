@@ -66,6 +66,7 @@ const http = require("node:http");
 
 const models = [
   "deepseek/deepseek-chat",
+  "deepseek/deepseek-reasoner",
   "google/gemini-2.5-flash",
   "minimax/MiniMax-M3",
   "anthropic/claude-sonnet-4-5",
@@ -105,7 +106,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/session") {
     const id = "s" + nextSession++;
-    sessions.set(id, { response: "" });
+    sessions.set(id, { response: "", directory: url.searchParams.get("directory") || "" });
     return send(res, 200, { id });
   }
 
@@ -119,11 +120,11 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const prompt = body.parts?.[0]?.text || "";
     if (body.agent) {
-      session.response = "agent=" + body.agent + " OK";
+      session.response = "agent=" + body.agent + " dir=" + session.directory + " OK";
     } else if (body.model) {
-      session.response = "model=" + body.model.providerID + "/" + body.model.modelID + " OK";
+      session.response = "model=" + body.model.providerID + "/" + body.model.modelID + " dir=" + session.directory + " OK";
     } else {
-      session.response = "chat OK";
+      session.response = "chat dir=" + session.directory + " OK";
     }
     session.prompt = prompt;
     return send(res, 200, { id: "m1" });
@@ -314,11 +315,18 @@ async function run() {
         await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
         const res = await srv.waitForResponse(2);
         const tool = res?.result?.tools?.find(t => t.name === "opencode");
+        const names = res?.result?.tools?.map(t => t.name) || [];
         assert(!!tool, "opencode tool is listed");
         assert(!!tool?.inputSchema?.properties?.agent, "schema supports agent");
         assert(!!tool?.inputSchema?.properties?.mode, "schema supports mode");
         assert(!!tool?.inputSchema?.properties?.model, "schema supports model");
         assert(!tool?.inputSchema?.properties?.agent?.enum, "agent names are not hardcoded as schema enum");
+        assert(names.includes("opencode_model_deepseek"), "dynamic DeepSeek provider tool is listed");
+        assert(names.includes("opencode_model_google"), "dynamic Google provider tool is listed");
+        assert(names.includes("opencode_model_gemini"), "dynamic Gemini family tool is listed");
+        assert(names.includes("opencode_model_claude"), "dynamic Claude family tool is listed");
+        assert(names.includes("opencode_model_gpt"), "dynamic GPT family tool is listed");
+        assert(names.includes("opencode_model_minimax"), "dynamic MiniMax provider tool is listed");
       });
     } finally {
       fix.cleanup();
@@ -393,6 +401,22 @@ async function run() {
         await srv.send({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "opencode", arguments: { model: "claude", prompt: "hi" } } });
         const claude = await srv.waitForResponse(6);
         assert(claude?.result?.content?.[0]?.text?.includes("model=anthropic/claude-sonnet-4-5"), "model=claude resolves to available Claude Sonnet model");
+
+        await srv.send({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { prompt: "hi" } } });
+        const deepseekTool = await srv.waitForResponse(7);
+        const deepseekText = deepseekTool?.result?.content?.[0]?.text || "";
+        assert(deepseekText.includes("model=deepseek/deepseek-chat"), "dynamic DeepSeek tool calls best provider model");
+        assert(deepseekText.includes("opencode-mcp-empty-"), "dynamic provider tools default to no project context");
+
+        await srv.send({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "reasoner", prompt: "hi", context: "cwd" } } });
+        const reasonerTool = await srv.waitForResponse(8);
+        const reasonerText = reasonerTool?.result?.content?.[0]?.text || "";
+        assert(reasonerText.includes("model=deepseek/deepseek-reasoner"), "dynamic provider tool accepts model query within provider");
+        assert(!reasonerText.includes("opencode-mcp-empty-"), "context=cwd disables empty context default");
+
+        await srv.send({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "opencode_model_claude", arguments: { prompt: "hi" } } });
+        const claudeTool = await srv.waitForResponse(9);
+        assert(claudeTool?.result?.content?.[0]?.text?.includes("model=anthropic/claude-sonnet-4-5"), "dynamic Claude family tool resolves to Anthropic Claude model");
       });
     } finally {
       fix.cleanup();
@@ -400,7 +424,34 @@ async function run() {
   }
 
   {
-    console.log("\n[6] resolves dynamic modes from config");
+    console.log("\n[6] supports alias tool modes");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        const res = await srv.waitForResponse(2);
+        const names = res?.result?.tools?.map(t => t.name) || [];
+        assert(!names.some(n => n.startsWith("opencode_model_")), "OPENCODE_ALIAS_TOOLS=off disables dynamic model tools");
+      }, { OPENCODE_ALIAS_TOOLS: "off" });
+    } finally {
+      fix.cleanup();
+    }
+
+    const modelFix = fixture();
+    try {
+      await withServer(modelFix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        const res = await srv.waitForResponse(2);
+        const names = res?.result?.tools?.map(t => t.name) || [];
+        assert(names.includes("opencode_model_deepseek_deepseek-chat"), "OPENCODE_ALIAS_TOOLS=models exposes per-model tools");
+      }, { OPENCODE_ALIAS_TOOLS: "models" });
+    } finally {
+      modelFix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[7] resolves dynamic modes from config");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
@@ -414,7 +465,7 @@ async function run() {
   }
 
   {
-    console.log("\n[7] proxies child MCPs and handles tool name collisions");
+    console.log("\n[8] proxies child MCPs and handles tool name collisions");
     const fix = fixture({ mcps: true });
     try {
       await withServer(fix, async (srv) => {
@@ -434,7 +485,7 @@ async function run() {
   }
 
   {
-    console.log("\n[8] shutdown");
+    console.log("\n[9] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

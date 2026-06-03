@@ -13,6 +13,8 @@
 │                      │                        │  ┌─────────────────────┐  │
 └──────────────────────┘                        │  │ opencode (direct)   │  │
                                                 │  ├─────────────────────┤  │
+                                                │  │ opencode_model_*    │  │
+                                                │  ├─────────────────────┤  │
                                                 │  │ codex → MCPClient   │  │
                                                 │  ├─────────────────────┤  │
                                                 │  │ focus → MCPClient   │  │
@@ -65,6 +67,8 @@ Hub → Client:  {"result":{"content":[...]}}
 - URL captured from `opencode server listening on ...` line
 - Communicates via HTTP with Basic Auth
 - Used by the `opencode` tool for agents and model calls
+- Dynamic shortcut tools are generated from `opencode models` as `opencode_model_<provider-or-family>` by default.
+- Shortcut tools default to an empty temporary working directory (`context: "none"`) so provider-only requests do not inherit the current repository context.
 
 ### Codex MCP Server
 - Command: `codex mcp-server`
@@ -88,3 +92,11 @@ The hub reads the `mcp` section from `opencode.jsonc`:
 ```
 
 To skip specific MCPs: `export OPENCODE_MCP_SKIP=codex,focus`
+
+To control dynamic model tools:
+
+```bash
+export OPENCODE_ALIAS_TOOLS=providers  # default: provider/family tools
+export OPENCODE_ALIAS_TOOLS=models     # one tool per full model ID
+export OPENCODE_ALIAS_TOOLS=off        # disable model shortcut tools
+```

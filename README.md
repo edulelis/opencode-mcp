@@ -22,7 +22,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.2.0/opencode-mcp-v5.2.0.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.3.0/opencode-mcp-v5.3.0.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -30,7 +30,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.2.0/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.3.0/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -56,7 +56,7 @@ codex mcp add opencode-mcp -- node ~/.opencode-mcp/src/index.mjs
 
 ## Usage
 
-The bridge exposes a single MCP tool called **`opencode`** with three modes:
+The bridge exposes a primary MCP tool called **`opencode`** plus dynamic model shortcut tools.
 
 ### 1. Run an agent (with all directives)
 
@@ -99,7 +99,48 @@ Examples:
 { "model": "flash", "prompt": "Quick answer" }
 ```
 
-### 3. List resources
+### 3. Dynamic provider/family shortcuts
+
+On `tools/list`, the bridge reads `opencode models` and automatically exposes provider/family tools:
+
+```text
+opencode_model_deepseek
+opencode_model_google
+opencode_model_gemini
+opencode_model_minimax
+opencode_model_anthropic
+opencode_model_claude
+opencode_model_openai
+opencode_model_gpt
+```
+
+The exact tools depend on your opencode model list. These shortcuts default to **no project context**, which makes requests like "call DeepSeek and ask oi" easier for MCP clients to route without leaking the current repo context.
+
+```json
+{
+  "prompt": "Say oi"
+}
+```
+
+You can still choose a specific model/query inside the provider:
+
+```json
+{
+  "model": "reasoner",
+  "prompt": "Think through this"
+}
+```
+
+Set `context` to `cwd` only when you want the provider shortcut to see the current working directory:
+
+```json
+{
+  "context": "cwd",
+  "prompt": "Review this repository"
+}
+```
+
+### 4. List resources
 
 ```json
 { "list": "agents" }
@@ -150,6 +191,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |
 | `OPENCODE_INCLUDE_REASONING` | off | Set `1` to include reasoning parts in returned text |
+| `OPENCODE_ALIAS_TOOLS` | `providers` | `providers` generates provider/family shortcuts, `models` generates one per model, `off` disables shortcuts |
 | `DEBUG` | off | Set `DEBUG=1` for verbose logs |
 
 ---

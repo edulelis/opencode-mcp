@@ -39,7 +39,7 @@ from GitHub, extracts it to `~/.opencode-mcp`, and prints next steps. No npm, no
 
 ```bash
 # Download the release zip
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.2.0/opencode-mcp-v5.2.0.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.3.0/opencode-mcp-v5.3.0.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 mv ~/opencode-mcp ~/.opencode-mcp
@@ -51,7 +51,7 @@ The entire MCP server is one self-contained file:
 
 ```bash
 mkdir -p ~/.opencode-mcp/src
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.2.0/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.3.0/src/index.mjs \
   -o ~/.opencode-mcp/src/index.mjs
 ```
 
@@ -125,6 +125,10 @@ If your MCP client supports explicit tool calls, the schema is:
 
 // Direct model chat. Short queries are resolved from `opencode models`.
 { "model": "gemini", "prompt": "What's new in ES2025?" }
+
+// Dynamic provider/family shortcut generated from `opencode models`.
+// Tool name example: opencode_model_deepseek
+{ "prompt": "Say oi" }
 
 // List resources
 { "list": "agents" }

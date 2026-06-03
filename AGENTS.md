@@ -12,7 +12,7 @@ MCP Client (Codex, Claude, etc.)
         ▼
   opencode-mcp (hub)
         │
-        ├── opencode serve   → agents, models (DeepSeek, Gemini, etc.)
+        ├── opencode serve   → agents, models, dynamic provider/family shortcuts
         ├── codex            → codex, codex-reply tools
         ├── focus            → dbt_debate, dsp_*, rev_*, agt_*, focus_* tools
         └── (any MCP from opencode.jsonc's "mcp" section)
@@ -26,7 +26,8 @@ The hub reads the `mcp` config from `opencode.jsonc`, starts each enabled MCP se
 - `_ensureOpencode()` — lazily starts `opencode serve` as HTTP backend
 - `_startProxiedMcps()` — spawns child MCP servers from opencode.jsonc's `mcp` section
 - `_waitForMcps()` — waits up to 8s for child MCPs to initialize
-- `_allTools` — merges opencode tool + all proxied MCP tools
+- `_refreshModelAliasTools()` — reads `opencode models` and creates dynamic `opencode_model_<provider-or-family>` tools
+- `_allTools` — merges opencode tool + dynamic model tools + all proxied MCP tools
 - `_toolBackend` — maps exposed tool names to `{ clientName, originalName }`
 
 ### `MCPClient` class
@@ -38,7 +39,7 @@ The hub reads the `mcp` config from `opencode.jsonc`, starts each enabled MCP se
 
 ## Tool Routing
 
-The `opencode` tool is handled directly by the hub (routes to opencode serve HTTP API). All other tool names are looked up in `_toolBackend` and forwarded to the appropriate MCPClient using the child tool's original name. Colliding tool names are prefixed with the child MCP name.
+The `opencode` tool is handled directly by the hub (routes to opencode serve HTTP API). Dynamic model shortcut tools such as `opencode_model_deepseek` and `opencode_model_claude` are generated from `opencode models` and default to no project context. All other tool names are looked up in `_toolBackend` and forwarded to the appropriate MCPClient using the child tool's original name. Colliding tool names are prefixed with the child MCP name.
 
 ## Key Files
 
@@ -46,7 +47,7 @@ The `opencode` tool is handled directly by the hub (routes to opencode serve HTT
 |------|---------|
 | `src/index.mjs` | **Single-file hub** — entire MCP server in one file |
 | `tests/test.mjs` | Hermetic test suite with fake opencode and fake MCP fixtures |
-| `.github/workflows/test.yml` | CI on push (Node 18/20/22) |
+| `.github/workflows/test.yml` | CI on push (Node 24 LTS) |
 | `scripts/setup.sh` | One-command install from GitHub release |
 
 ## Design Rules

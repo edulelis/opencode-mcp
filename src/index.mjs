@@ -19,19 +19,20 @@
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
+ *   OPENCODE_ALIAS_TOOLS     off|providers|models            (default: providers)
  *   DEBUG                     set "1" for verbose logs
  */
 
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.2.0";
+const VERSION = "5.3.0";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -84,6 +85,7 @@ const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
 const INCLUDE_REASONING = process.env.OPENCODE_INCLUDE_REASONING === "1";
+const ALIAS_TOOLS = normalizeName(process.env.OPENCODE_ALIAS_TOOLS || "providers");
 
 const AGENTS = CFG.agent
   ? Object.entries(CFG.agent).map(([n, d]) => ({ name: n, description: (d.description || n).split("\n")[0].slice(0, 120), model: d.model || "default" }))
@@ -91,6 +93,11 @@ const AGENTS = CFG.agent
 
 function normalizeName(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function sanitizeToolName(value) {
+  const safe = normalizeName(value).replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+  return safe || "model";
 }
 
 // ─── MCP Client — proxies a child MCP server ───────────────────────────────
@@ -263,6 +270,10 @@ class OpencodeHub {
     this._openServerStarting = null;
     this._openServerExitCode = null;
     this._modelCache = { at: 0, text: "", models: [] };
+    this._modelAliasTools = [];
+    this._modelToolBackend = {};
+    this._modelToolCacheKey = "";
+    this._emptyContextDir = null;
 
     // Proxied MCP backends
     this._mcpClients = []; // MCPClient[]
@@ -375,6 +386,21 @@ class OpencodeHub {
     return [...new Set(matches.map(m => m.trim()).filter(Boolean))];
   }
 
+  _modelProvider(model) {
+    return String(model || "").split("/")[0] || "";
+  }
+
+  _modelID(model) {
+    const idx = String(model || "").indexOf("/");
+    return idx === -1 ? "" : String(model).slice(idx + 1);
+  }
+
+  _modelFamily(model) {
+    const family = this._modelID(model).split(/[^A-Za-z0-9]+/).find(Boolean);
+    const normalized = sanitizeToolName(family);
+    return normalized && /[a-z]/.test(normalized) && normalized.length >= 3 ? normalized : "";
+  }
+
   _availableModels(force = false) {
     const now = Date.now();
     if (!force && this._modelCache.models.length && now - this._modelCache.at < MODEL_CACHE_MS) {
@@ -455,6 +481,124 @@ class OpencodeHub {
     return `${text.trim()}\n\n# You can also use short model queries\n${discoveredAliases.slice(0, 80).join(", ")}\n`;
   }
 
+  _emptyContextDirectory() {
+    if (!this._emptyContextDir || !existsSync(this._emptyContextDir)) {
+      this._emptyContextDir = mkdtempSync(join(tmpdir(), "opencode-mcp-empty-"));
+    }
+    return this._emptyContextDir;
+  }
+
+  _resolveDirectory(directory, context, defaultContext = "cwd") {
+    if (directory) return directory;
+    const selected = normalizeName(context || defaultContext);
+    return selected === "none" ? this._emptyContextDirectory() : process.cwd();
+  }
+
+  _uniqueModelToolName(baseName) {
+    let name = baseName;
+    let i = 2;
+    while (name === "opencode" || this._toolBackend[name] || this._modelToolBackend[name]) {
+      name = `${baseName}_${i++}`;
+    }
+    return name;
+  }
+
+  _modelToolSchema(defaultContext = "none") {
+    return {
+      type: "object",
+      required: ["prompt"],
+      properties: {
+        prompt: { type: "string", description: "The prompt to send to this model/provider." },
+        model: { type: "string", description: "Optional model ID or short query within this provider/family." },
+        context: { type: "string", enum: ["none", "cwd"], default: defaultContext, description: "Use no project context or the current working directory." },
+        directory: { type: "string", description: "Explicit working directory. Overrides context when provided." },
+      },
+    };
+  }
+
+  _buildProviderAliasTools(models) {
+    const groups = new Map();
+    const add = (key, model) => {
+      if (!key) return;
+      if (!groups.has(key)) groups.set(key, []);
+      if (!groups.get(key).includes(model)) groups.get(key).push(model);
+    };
+
+    for (const model of models) {
+      const provider = this._modelProvider(model);
+      const providerKey = sanitizeToolName(provider);
+      const familyKey = this._modelFamily(model);
+      add(providerKey, model);
+      if (familyKey && familyKey !== providerKey) add(familyKey, model);
+    }
+
+    return [...groups.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([alias, providerModels]) => {
+        const name = this._uniqueModelToolName(`opencode_model_${alias}`);
+        this._modelToolBackend[name] = { provider: alias, models: providerModels, fixedModel: null };
+        const modelList = providerModels.slice(0, 12).map(m => `- ${m}`).join("\n");
+        const more = providerModels.length > 12 ? `\n- ... ${providerModels.length - 12} more` : "";
+        return {
+          name,
+          description:
+            `Call ${alias} models through opencode with no project context by default.\n\n` +
+            `Available models:\n${modelList}${more}\n\n` +
+            `Use this when the user asks for ${alias} or one of these models. ` +
+            `Pass "model" to select a specific model/query inside this provider or family.`,
+          inputSchema: this._modelToolSchema("none"),
+        };
+      });
+  }
+
+  _buildModelAliasTools(models) {
+    return models
+      .slice()
+      .sort((a, b) => a.localeCompare(b))
+      .map((model) => {
+        const safe = sanitizeToolName(model);
+        const name = this._uniqueModelToolName(`opencode_model_${safe}`);
+        this._modelToolBackend[name] = { provider: this._modelProvider(model), models: [model], fixedModel: model };
+        return {
+          name,
+          description: `Call ${model} through opencode with no project context by default.`,
+          inputSchema: this._modelToolSchema("none"),
+        };
+      });
+  }
+
+  _refreshModelAliasTools(force = false) {
+    this._modelAliasTools = [];
+    this._modelToolBackend = {};
+
+    if (["off", "false", "0", "none"].includes(ALIAS_TOOLS)) return;
+    if (!OPENCODE_BIN) return;
+
+    try {
+      const { models } = this._availableModels(force);
+      const key = `${ALIAS_TOOLS}:${models.join("|")}`;
+      if (!force && key === this._modelToolCacheKey && this._modelAliasTools.length) return;
+
+      this._modelToolCacheKey = key;
+      if (ALIAS_TOOLS === "models") {
+        this._modelAliasTools = this._buildModelAliasTools(models);
+      } else {
+        this._modelAliasTools = this._buildProviderAliasTools(models);
+      }
+    } catch (e) {
+      log(`Model alias tools unavailable: ${e.message}`);
+      this._modelAliasTools = [];
+      this._modelToolBackend = {};
+    }
+  }
+
+  _resolveProviderModel(backend, requestedModel) {
+    if (backend.fixedModel && !requestedModel) return backend.fixedModel;
+    if (backend.fixedModel && requestedModel) return this._resolveModelFromList(requestedModel, backend.models);
+    const query = requestedModel || backend.provider;
+    return this._resolveModelFromList(query, backend.models);
+  }
+
   _resolveAgent(agentName) {
     const wanted = String(agentName || "").trim();
     if (!wanted || !AGENTS.length) return { name: wanted, ambiguous: [], found: true };
@@ -473,9 +617,9 @@ class OpencodeHub {
     return { name: wanted, ambiguous: [], found: false };
   }
 
-  async _opencodeCall(agent, model, prompt, directory) {
+  async _opencodeCall(agent, model, prompt, directory, context = "cwd") {
     await this._ensureOpencode();
-    const dir = directory || process.cwd();
+    const dir = this._resolveDirectory(directory, context, "cwd");
     // Session create: directory goes in query params
     const session = await this._api("POST", "/session", { title: `opencode-mcp: ${agent || model || "chat"}` }, { directory: dir });
     const sid = session.id;
@@ -671,6 +815,7 @@ class OpencodeHub {
           model: { type: "string", description: "Model in provider/name format, or a short query such as deepseek, gemini, minimax, claude, gpt, flash, pro." },
           prompt: { type: "string", description: "The prompt or task" },
           list: { type: "string", description: "Set to \"agents\" or \"models\"", enum: ["agents", "models"] },
+          context: { type: "string", description: "Use no project context or the current working directory.", enum: ["none", "cwd"], default: "cwd" },
           directory: { type: "string", description: "Working directory" },
         },
       },
@@ -678,7 +823,7 @@ class OpencodeHub {
   }
 
   get _allTools() {
-    return [this._opencodeTool, ...this._proxiedTools];
+    return [this._opencodeTool, ...this._modelAliasTools, ...this._proxiedTools];
   }
 
   // ── JSON-RPC handlers ─────────────────────────────────────────────
@@ -700,6 +845,7 @@ class OpencodeHub {
 
       case "tools/list":
         await this._waitForMcps();
+        this._refreshModelAliasTools();
         return this.r(id, { tools: this._allTools });
 
       case "tools/call":
@@ -724,7 +870,7 @@ class OpencodeHub {
     try {
       // ── opencode tool ───────────────────────────────────────────
       if (toolName === "opencode") {
-        const { model, prompt, list, directory } = args;
+        const { model, prompt, list, directory, context } = args;
         const requestedAgent = args.agent || args.mode;
 
         if (list === "agents") {
@@ -745,15 +891,29 @@ class OpencodeHub {
             return this.toolError(id, `Agent/mode "${requestedAgent}" not found. Available: ${AGENTS.map(a => a.name).join(", ") || "(opencode will decide if config is unavailable)"}`);
           }
           log(`Run agent: ${resolvedAgent.name}`);
-          const result = await this._opencodeCall(resolvedAgent.name, null, prompt, directory);
+          const result = await this._opencodeCall(resolvedAgent.name, null, prompt, directory, context || "cwd");
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
         if (model) {
           log(`Chat model: ${model}`);
-          const result = await this._opencodeCall(null, model, prompt, directory);
+          const result = await this._opencodeCall(null, model, prompt, directory, context || "cwd");
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
         return this.toolError(id, "Provide agent+prompt, mode+prompt, model+prompt, or list.");
+      }
+
+      // ── Dynamic opencode model alias tools ───────────────────────
+      if (toolName.startsWith("opencode_model_") && !this._modelToolBackend[toolName]) {
+        this._refreshModelAliasTools();
+      }
+      const modelBackend = this._modelToolBackend[toolName];
+      if (modelBackend) {
+        const { prompt, model, directory, context } = args;
+        if (!prompt) return this.toolError(id, "Provide prompt.");
+        const resolvedModel = this._resolveProviderModel(modelBackend, model);
+        log(`Alias tool "${toolName}" resolved to model: ${resolvedModel}`);
+        const result = await this._opencodeCall(null, resolvedModel, prompt, directory, context || "none");
+        return this.r(id, { content: [{ type: "text", text: result }] });
       }
 
       // ── Proxied MCP tool ────────────────────────────────────────
@@ -784,7 +944,13 @@ class OpencodeHub {
     this._mcpClients = [];
     this._proxiedTools = [];
     this._toolBackend = {};
+    this._modelAliasTools = [];
+    this._modelToolBackend = {};
     this._mcpsStarted = null;
+    if (this._emptyContextDir) {
+      try { rmSync(this._emptyContextDir, { recursive: true, force: true }); } catch {}
+      this._emptyContextDir = null;
+    }
   }
 
   toolError(id, text) {

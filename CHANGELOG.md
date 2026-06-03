@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.3.0 (2026-06-03)
+
+- **Dynamic provider/family tools**: `tools/list` now generates `opencode_model_<provider-or-family>` shortcuts from the live `opencode models` output, so MCP clients can discover DeepSeek, Gemini, Claude, MiniMax, OpenAI/GPT, and future providers without hardcoded tool names.
+- **No-context shortcuts**: Dynamic model shortcut tools default to `context: "none"` using an empty temporary directory, while the generic `opencode` tool keeps `cwd` as its default.
+- **Alias modes**: Added `OPENCODE_ALIAS_TOOLS=providers|models|off` to choose one tool per provider, one tool per full model, or disable shortcuts.
+- **Tests**: Added coverage for dynamic provider discovery, per-model aliases, alias disabling, provider-local model selection, and no-context defaults.
+
 ## 5.2.0 (2026-06-03)
 
 - **Dynamic model queries**: Short model names such as `deepseek`, `gemini`, `minimax`, `claude`, `gpt`, `flash`, and `pro` are resolved from the live `opencode models` output instead of hardcoded model IDs.
