@@ -24,13 +24,13 @@ BANNER
 info "Checking dependencies..."
 
 if ! command -v node &>/dev/null; then
-  err "Node.js >= 18 is required. Install: https://nodejs.org"
+  err "Node.js >= 24 is required. Install: https://nodejs.org"
   exit 1
 fi
 
 NODE_VER=$(node -v | sed 's/v//' | cut -d. -f1)
-if [ "$NODE_VER" -lt 18 ]; then
-  err "Node.js >= 18 required, found $(node -v)"
+if [ "$NODE_VER" -lt 24 ]; then
+  err "Node.js >= 24 required, found $(node -v)"
   exit 1
 fi
 ok "Node.js $(node -v)"

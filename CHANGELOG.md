@@ -11,6 +11,7 @@
 - **MCP proxy hardening**: Child MCP startup now sends `notifications/initialized`, cleans up failed subprocesses, rejects pending calls if a child exits, and prefixes colliding tool names.
 - **Clean output by default**: Reasoning parts are no longer included in returned text unless `OPENCODE_INCLUDE_REASONING=1` is set.
 - **Hermetic tests**: The test suite now uses fake opencode and fake MCP fixtures, so CI does not depend on local credentials or a real opencode install.
+- **Runtime baseline**: Raised the supported runtime to Node.js 24 LTS.
 
 ## 5.1.0 (2026-06-02)
 

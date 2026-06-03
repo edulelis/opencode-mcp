@@ -50,7 +50,7 @@ codex mcp add opencode-mcp -- node ~/.opencode-mcp/src/index.mjs
 ### Requirements
 
 - [opencode CLI](https://opencode.ai) installed (`curl -fsSL https://opencode.ai/install | sh`)
-- Node.js >= 18
+- Node.js >= 24 LTS
 
 ---
 

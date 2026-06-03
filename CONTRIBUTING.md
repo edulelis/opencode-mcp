@@ -21,7 +21,7 @@ npm test
 1. **Zero dependencies** — keep `src/index.mjs` pure Node.js
 2. **Self-contained** — the MCP server is one file for easy distribution
 3. **Debug logging** — use `if (IS_DEBUG) console.error(...)` pattern
-4. **Compatibility** — support Node.js >= 18
+4. **Compatibility** — support Node.js >= 24 LTS
 5. **Error messages** — be descriptive; the bridge runs headless, errors must be clear
 
 ## Testing
