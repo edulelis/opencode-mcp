@@ -22,7 +22,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v4.1.0/opencode-mcp-v4.1.0.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.2.0/opencode-mcp-v5.2.0.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -30,7 +30,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v4.1.0/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.2.0/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -62,23 +62,42 @@ The bridge exposes a single MCP tool called **`opencode`** with three modes:
 
 ```json
 {
-  "agent": "ultra",
+  "agent": "your-agent",
   "prompt": "Refactor this function for readability"
 }
 ```
 
-Runs the agent with its full system prompt, permissions, model, and fallbacks from `opencode.jsonc`.
+Runs the agent with its full system prompt, permissions, model, and fallbacks from `opencode.jsonc`. Agent names are discovered from your config at startup, so custom modes work without code changes.
+
+You can also use `mode` as an alias for `agent`, and unique partial names are accepted:
+
+```json
+{
+  "mode": "plan",
+  "prompt": "Sketch the implementation steps"
+}
+```
 
 ### 2. Direct model chat (no agent directives)
 
 ```json
 {
-  "model": "deepseek/deepseek-chat",
+  "model": "deepseek",
   "prompt": "Explain dependency injection"
 }
 ```
 
-Calls any model directly. Useful when you want a raw model response without agent wrappers.
+Calls any model directly. Full model IDs still work, but short queries are resolved from `opencode models`, not hardcoded in this bridge.
+
+Examples:
+
+```json
+{ "model": "deepseek", "prompt": "Say oi" }
+{ "model": "gemini", "prompt": "Summarize this" }
+{ "model": "minimax", "prompt": "Draft release notes" }
+{ "model": "claude", "prompt": "Review this API" }
+{ "model": "flash", "prompt": "Quick answer" }
+```
 
 ### 3. List resources
 
@@ -125,6 +144,12 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_BIN` | auto-detect | Path to opencode binary |
 | `OPENCODE_CONFIG` | auto-detect | Path to opencode.jsonc |
 | `OPENCODE_SERVER_PASSWORD` | from env | Password for opencode serve |
+| `OPENCODE_MCP_SKIP` | none | Comma-separated MCP names to skip from `opencode.jsonc` |
+| `OPENCODE_TOOL_TIMEOUT_MS` | `600000` | Max wait for opencode agent/model calls |
+| `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
+| `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
+| `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |
+| `OPENCODE_INCLUDE_REASONING` | off | Set `1` to include reasoning parts in returned text |
 | `DEBUG` | off | Set `DEBUG=1` for verbose logs |
 
 ---
@@ -135,7 +160,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 MCP Client (Codex, Claude, etc.)
   ──[JSON-RPC over stdio]──> opencode-mcp (MCP server)
                                   │
-                                  ├── starts `opencode serve` (headless subprocess)
+                                  ├── starts `opencode serve` lazily when a model/agent is called
                                   ├── creates session with agent/model
                                   ├── sends prompt via HTTP API
                                   ├── polls for response

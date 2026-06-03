@@ -40,10 +40,12 @@ Each child MCP server runs as a subprocess communicating via JSON-RPC 2.0 over s
 Hub → Child:  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
 Child → Hub:  {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",...}}
 
+Hub → Child:  {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
 Hub → Child:  {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 Child → Hub:  {"jsonrpc":"2.0","id":2,"result":{"tools":[...]}}
 
-Hub stores tools in _toolBackend[tool.name] = "mcp:childName"
+Hub stores tools in _toolBackend[exposedName] = { clientName, originalName }.
+If two child MCPs expose the same tool name, the later one is prefixed with the child MCP name.
 ```
 
 ### Tool Execution Flow
@@ -51,7 +53,7 @@ Hub stores tools in _toolBackend[tool.name] = "mcp:childName"
 ```
 Client → Hub:  {"method":"tools/call","params":{"name":"dbt_debate",...}}
 Hub → Child:   {"jsonrpc":"2.0","id":3,"method":"tools/call",
-                 "params":{"name":"dbt_debate","arguments":{...}}}
+                 "params":{"name":"<original child tool name>","arguments":{...}}}
 Child → Hub:   {"jsonrpc":"2.0","id":3,"result":{"content":[...]}}
 Hub → Client:  {"result":{"content":[...]}}
 ```
@@ -59,7 +61,7 @@ Hub → Client:  {"result":{"content":[...]}}
 ## Backend Details
 
 ### opencode serve (direct HTTP)
-- Started with `--port=0` (random port)
+- Started lazily with `--port=0` (random port)
 - URL captured from `opencode server listening on ...` line
 - Communicates via HTTP with Basic Auth
 - Used by the `opencode` tool for agents and model calls

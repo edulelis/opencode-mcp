@@ -6,8 +6,8 @@
 git clone https://github.com/edulelis/opencode-mcp.git
 cd opencode-mcp
 
-# Test directly
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | node src/index.mjs
+# Hermetic test suite, no real opencode credentials required
+npm test
 ```
 
 ## Structure
@@ -34,7 +34,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 
 # Manual tool call (requires opencode + credentials)
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"opencode","arguments":{"agent":"quick","prompt":"say OK"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"opencode","arguments":{"model":"deepseek","prompt":"say OK"}}}
 ' | node src/index.mjs
 ```
 

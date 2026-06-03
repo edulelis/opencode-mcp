@@ -3,85 +3,259 @@
 /**
  * opencode-mcp test suite.
  *
- * Spawns the MCP server, sends JSON-RPC messages, validates responses.
+ * The default suite is hermetic: it uses a temporary opencode config,
+ * a fake opencode binary, and fake child MCP servers. No real credentials
+ * or local opencode installation are required.
  *
  * Usage:
- *   node tests/test.mjs                  # full suite
- *   node tests/test.mjs --quick          # skip model calls (CI-safe)
- *   node tests/test.mjs --verbose        # show all traffic
+ *   node tests/test.mjs
+ *   node tests/test.mjs --verbose
  */
 
 import { spawn } from "node:child_process";
-import { join, dirname } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(__dirname, "..", "src", "index.mjs");
 const VERBOSE = process.argv.includes("--verbose");
-const QUICK = process.argv.includes("--quick");
 
 let passed = 0;
 let failed = 0;
 const errors = [];
 
 function assert(condition, msg) {
-  if (condition) { passed++; process.stdout.write("  \x1b[32m✓\x1b[0m"); }
-  else { failed++; process.stdout.write("  \x1b[31m✗\x1b[0m"); errors.push(msg); }
-  console.log(" " + msg);
+  if (condition) {
+    passed++;
+    console.log(`  PASS ${msg}`);
+  } else {
+    failed++;
+    errors.push(msg);
+    console.log(`  FAIL ${msg}`);
+  }
 }
 
-// ─── Spawn server ──────────────────────────────────────────────────────────
-function createServer(timeoutMs = 30_000) {
+function fixture({ opencode = true, mcps = false } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "opencode-mcp-test-"));
+  const home = join(root, "home");
+  const binDir = join(root, "bin");
+  const configPath = join(root, "opencode.jsonc");
+  const opencodePath = join(binDir, "opencode");
+  const mcpPath = join(binDir, "fake-mcp");
+
+  writeFileSync(configPath, JSON.stringify({
+    agent: {
+      scout: { description: "Fast scout mode", model: "deepseek/deepseek-chat" },
+      builder: { description: "Build mode", model: "minimax/MiniMax-M3" },
+    },
+    mcp: mcps ? {
+      alpha: { type: "local", command: [mcpPath], env: { FAKE_MCP_NAME: "alpha" } },
+      beta: { type: "local", command: [mcpPath], env: { FAKE_MCP_NAME: "beta" } },
+    } : {},
+  }, null, 2));
+
+  writeFileSync(join(root, ".keep"), "");
+  awaitableMkdir(home);
+  awaitableMkdir(binDir);
+
+  if (opencode) {
+    writeFileSync(opencodePath, `#!/usr/bin/env node
+import http from "node:http";
+
+const models = [
+  "deepseek/deepseek-chat",
+  "google/gemini-2.5-flash",
+  "minimax/MiniMax-M3",
+  "anthropic/claude-sonnet-4-5",
+  "openai/gpt-5.4-mini"
+];
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+function send(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+if (process.argv[2] === "models") {
+  console.log(models.join("\\n"));
+  process.exit(0);
+}
+
+if (process.argv[2] !== "serve") {
+  console.error("unknown fake opencode command");
+  process.exit(1);
+}
+
+let nextSession = 1;
+const sessions = new Map();
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1");
+
+  if (req.method === "POST" && url.pathname === "/session") {
+    const id = "s" + nextSession++;
+    sessions.set(id, { response: "" });
+    return send(res, 200, { id });
+  }
+
+  const match = url.pathname.match(/^\\/session\\/([^/]+)(?:\\/message)?$/);
+  if (!match) return send(res, 404, { error: "not found" });
+  const sid = match[1];
+  const session = sessions.get(sid);
+  if (!session) return send(res, 404, { error: "missing session" });
+
+  if (req.method === "POST" && url.pathname.endsWith("/message")) {
+    const body = await readBody(req);
+    const prompt = body.parts?.[0]?.text || "";
+    if (body.agent) {
+      session.response = "agent=" + body.agent + " OK";
+    } else if (body.model) {
+      session.response = "model=" + body.model.providerID + "/" + body.model.modelID + " OK";
+    } else {
+      session.response = "chat OK";
+    }
+    session.prompt = prompt;
+    return send(res, 200, { id: "m1" });
+  }
+
+  if (req.method === "GET" && url.pathname.endsWith("/message")) {
+    return send(res, 200, [
+      { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: session.response || "" }] }
+    ]);
+  }
+
+  if (req.method === "DELETE") {
+    sessions.delete(sid);
+    return send(res, 200, {});
+  }
+
+  return send(res, 404, { error: "not found" });
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const address = server.address();
+  console.log("opencode server listening on http://127.0.0.1:" + address.port);
+});
+`, "utf-8");
+    chmodSync(opencodePath, 0o755);
+  }
+
+  if (mcps) {
+    writeFileSync(mcpPath, `#!/usr/bin/env node
+const name = process.env.FAKE_MCP_NAME || "fake";
+let buffer = "";
+let initialized = false;
+
+function send(msg) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+
+process.stdin.setEncoding("utf-8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split("\\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name, version: "1.0.0" } } });
+    } else if (msg.method === "notifications/initialized") {
+      initialized = true;
+    } else if (msg.method === "tools/list") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { tools: [
+        { name: "echo", description: "Echo from " + name, inputSchema: { type: "object", properties: { value: { type: "string" } } } }
+      ] } });
+    } else if (msg.method === "tools/call") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: name + ":" + msg.params.name + ":" + msg.params.arguments.value + ":initialized=" + initialized }] } });
+    } else if (msg.method === "shutdown") {
+      send({ jsonrpc: "2.0", id: msg.id, result: null });
+      process.exit(0);
+    }
+  }
+});
+`, "utf-8");
+    chmodSync(mcpPath, 0o755);
+  }
+
+  return {
+    root,
+    home,
+    configPath,
+    opencodePath,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+function awaitableMkdir(path) {
+  mkdirSync(path, { recursive: true });
+}
+
+function createServer(fix, extraEnv = {}, timeoutMs = 30_000) {
   if (!existsSync(SERVER)) throw new Error(`Server not found: ${SERVER}`);
 
-  const proc = spawn("node", [SERVER], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, DEBUG: "" }, // keep stderr clean
-    timeout: timeoutMs,
-  });
+  const env = {
+    ...process.env,
+    DEBUG: "",
+    HOME: fix.home,
+    OPENCODE_CONFIG: fix.configPath,
+    OPENCODE_BIN: fix.opencodePath,
+    OPENCODE_TOOL_TIMEOUT_MS: "3000",
+    OPENCODE_PROXY_TIMEOUT_MS: "3000",
+    OPENCODE_POLL_INTERVAL_MS: "20",
+    ...extraEnv,
+  };
 
-  let resolveClosed;
-  const closedPromise = new Promise((r) => { resolveClosed = r; });
-  proc.on("close", resolveClosed);
+  const proc = spawn("node", [SERVER], { stdio: ["pipe", "pipe", "pipe"], env, timeout: timeoutMs });
 
   function send(msg) {
     return new Promise((resolve) => {
       const json = JSON.stringify(msg) + "\n";
-      if (VERBOSE) console.error("\x1b[90m>>>\x1b[0m", json.trim());
+      if (VERBOSE) console.error(">>>", json.trim());
       proc.stdin.write(json, () => resolve());
     });
   }
 
-  function waitForResponse(id, timeoutMs = 10_000) {
+  function waitForResponse(id, timeout = 10_000) {
     return new Promise((resolve) => {
       let buf = "";
-      const start = Date.now();
       const onData = (chunk) => {
         buf += chunk.toString();
         const lines = buf.split("\n");
+        buf = lines.pop() || "";
         for (const line of lines) {
           try {
             const parsed = JSON.parse(line.trim());
             if (parsed.id === id) {
               proc.stdout.removeListener("data", onData);
-              if (VERBOSE) console.error("\x1b[90m<<<\x1b[0m", JSON.stringify(parsed).slice(0, 200));
-              return resolve(parsed);
+              if (VERBOSE) console.error("<<<", JSON.stringify(parsed));
+              resolve(parsed);
+              return;
             }
           } catch {}
         }
-        // Keep incomplete line in buffer
-        buf = lines.pop() || "";
       };
       proc.stdout.on("data", onData);
       setTimeout(() => {
         proc.stdout.removeListener("data", onData);
         resolve(null);
-      }, timeoutMs);
+      }, timeout);
     });
   }
 
-  function waitForBanner(timeoutMs = 5000) {
+  function waitForBanner(timeout = 5000) {
     return new Promise((resolve) => {
       const onData = (chunk) => {
         if (chunk.toString().includes("Ready.")) {
@@ -90,7 +264,7 @@ function createServer(timeoutMs = 30_000) {
         }
       };
       proc.stderr.on("data", onData);
-      setTimeout(() => resolve(), timeoutMs);
+      setTimeout(resolve, timeout);
     });
   }
 
@@ -101,235 +275,189 @@ function createServer(timeoutMs = 30_000) {
   return { proc, send, waitForResponse, waitForBanner, cleanup };
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────
+async function withServer(fix, fn, extraEnv) {
+  const srv = createServer(fix, extraEnv);
+  try {
+    await srv.waitForBanner();
+    await srv.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } } });
+    const init = await srv.waitForResponse(1);
+    await fn(srv, init);
+  } finally {
+    srv.cleanup();
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+
 async function run() {
-  console.log("\n\x1b[1mopencode-mcp test suite\x1b[0m\n");
-  if (QUICK) console.log("  \x1b[33mQuick mode: skipping model calls\x1b[0m\n");
+  console.log("\nopencode-mcp test suite\n");
 
-  // ── 1. Initialize handshake ───────────────────────────────────────
   {
-    console.log("\x1b[1m[1] MCP Handshake\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    const res = await srv.waitForResponse(1);
-
-    assert(res?.result?.protocolVersion === "2024-11-05", "initialize returns protocol version");
-    assert(res?.result?.serverInfo?.name === "opencode-mcp", 'server info name is "opencode-mcp"');
-    assert(res?.result?.capabilities?.tools, "capabilities includes tools");
-    assert(!res?.error, "no error on initialize");
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 2. tools/list ─────────────────────────────────────────────────
-  {
-    console.log("\n\x1b[1m[2] tools/list\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-    const res = await srv.waitForResponse(2);
-
-    assert(res?.result?.tools?.length >= 1, "at least 1 tool exposed");
-    assert(res?.result?.tools?.[0]?.name === "opencode", 'tool name is "opencode"');
-    assert(res?.result?.tools?.[0]?.inputSchema, "tool has inputSchema");
-    assert(
-      res?.result?.tools?.[0]?.inputSchema?.properties?.agent ||
-      res?.result?.tools?.[0]?.inputSchema?.properties?.model,
-      "tool supports agent/model params"
-    );
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 3. Error: unknown tool ────────────────────────────────────────
-  {
-    console.log("\n\x1b[1m[3] Error handling\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({
-      jsonrpc: "2.0", id: 99, method: "tools/call",
-      params: { name: "nonexistent", arguments: {} },
-    });
-    const res = await srv.waitForResponse(99);
-
-    assert(res?.error?.code === -32601 || res?.error, "unknown tool returns error");
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 4. opencode with list:agents ──────────────────────────────────
-  {
-    console.log("\n\x1b[1m[4] opencode tool — list:agents\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({
-      jsonrpc: "2.0", id: 2, method: "tools/call",
-      params: { name: "opencode", arguments: { list: "agents" } },
-    });
-    const res = await srv.waitForResponse(2);
-
-    assert(res?.result?.content?.[0]?.text, "list:agents returns text");
-    assert(
-      res?.result?.content?.[0]?.text?.includes("ultra") ||
-      res?.result?.content?.[0]?.text?.includes("build"),
-      "agents list includes known agents"
-    );
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 5. opencode with missing params ───────────────────────────────
-  {
-    console.log("\n\x1b[1m[5] opencode tool — missing params\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({
-      jsonrpc: "2.0", id: 2, method: "tools/call",
-      params: { name: "opencode", arguments: {} },
-    });
-    const res = await srv.waitForResponse(2);
-
-    assert(res?.result?.content?.[0]?.text, "empty args returns guidance");
-    assert(
-      res?.result?.content?.[0]?.text?.includes("agent") ||
-      res?.result?.content?.[0]?.text?.includes("list"),
-      "guidance mentions available options"
-    );
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 6. opencode with unknown agent ────────────────────────────────
-  {
-    console.log("\n\x1b[1m[6] opencode tool — unknown agent\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({
-      jsonrpc: "2.0", id: 2, method: "tools/call",
-      params: { name: "opencode", arguments: { agent: "nobody", prompt: "hi" } },
-    });
-    const res = await srv.waitForResponse(2);
-
-    assert(res?.result?.content?.[0]?.text?.includes("not found"), "unknown agent returns error");
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  // ── 7. opencode with agent + prompt (real model call) ─────────────
-  if (!QUICK) {
-    console.log("\n\x1b[1m[7] opencode tool — agent execution (calls a real model)\x1b[0m");
-    const srv = createServer(180_000);
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    // Give server time to pre-start opencode backend
-    console.log("     \x1b[33mStarting backend & calling model (up to 120s)...\x1b[0m");
-    await new Promise((r) => setTimeout(r, 4000));
-
-    await srv.send({
-      jsonrpc: "2.0", id: 7, method: "tools/call",
-      params: {
-        name: "opencode",
-        arguments: { agent: "quick", prompt: "Say just 'OK' and nothing else" },
-      },
-    });
-
-    const res = await srv.waitForResponse(7, 120_000);
-
-    if (res?.result?.content?.[0]?.text) {
-      assert(true, "agent returned a response");
-      const text = res.result.content[0].text;
-      assert(text.toLowerCase().includes("ok"), 'response contains "OK"');
-      console.log("     \x1b[32mResponse:\x1b[0m", text.slice(0, 150).replace(/\n/g, " "));
-    } else if (res?.error) {
-      console.log("     \x1b[33mModel error (external):\x1b[0m", (res.error.message || "").slice(0, 100));
-      assert(true, "bridge mechanism works (model error is external)");
-    } else {
-      assert(false, `no response within timeout (got: ${res ? JSON.stringify(res).slice(0, 80) : "null"})`);
+    console.log("[1] initializes without an opencode binary");
+    const fix = fixture({ opencode: false });
+    try {
+      await withServer(fix, async (_srv, init) => {
+        assert(init?.result?.protocolVersion === "2024-11-05", "initialize returns protocol version");
+        assert(init?.result?.serverInfo?.name === "opencode-mcp", "server info name is opencode-mcp");
+        assert(init?.result?.capabilities?.tools, "capabilities includes tools");
+        assert(!init?.error, "initialize has no error");
+      }, { OPENCODE_BIN: join(fix.root, "missing-opencode") });
+    } finally {
+      fix.cleanup();
     }
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
-  } else {
-    console.log("\n\x1b[1m[7] Agent execution (model call)\x1b[0m  \x1b[33mSKIPPED (--quick)\x1b[0m");
   }
 
-  // ── 8. Shutdown ───────────────────────────────────────────────────
   {
-    console.log("\n\x1b[1m[8] Shutdown\x1b[0m");
-    const srv = createServer();
-    await srv.waitForBanner();
-
-    await srv.send({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } },
-    });
-    await srv.waitForResponse(1);
-
-    await srv.send({ jsonrpc: "2.0", id: 2, method: "shutdown", params: {} });
-    const res = await srv.waitForResponse(2);
-
-    assert(res?.result === null, "shutdown returns null");
-    assert(!res?.error, "no error on shutdown");
-    srv.cleanup();
-    await new Promise((r) => setTimeout(r, 300));
+    console.log("\n[2] exposes opencode tool schema");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        const res = await srv.waitForResponse(2);
+        const tool = res?.result?.tools?.find(t => t.name === "opencode");
+        assert(!!tool, "opencode tool is listed");
+        assert(!!tool?.inputSchema?.properties?.agent, "schema supports agent");
+        assert(!!tool?.inputSchema?.properties?.mode, "schema supports mode");
+        assert(!!tool?.inputSchema?.properties?.model, "schema supports model");
+        assert(!tool?.inputSchema?.properties?.agent?.enum, "agent names are not hardcoded as schema enum");
+      });
+    } finally {
+      fix.cleanup();
+    }
   }
 
-  // ── Summary ───────────────────────────────────────────────────────
+  {
+    console.log("\n[3] lists agents from config dynamically");
+    const fix = fixture({ opencode: false });
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode", arguments: { list: "agents" } } });
+        const res = await srv.waitForResponse(2);
+        const text = res?.result?.content?.[0]?.text || "";
+        assert(text.includes("scout"), "agents list includes fixture agent scout");
+        assert(text.includes("builder"), "agents list includes fixture agent builder");
+        assert(!res?.error, "list:agents returns a tool result, not JSON-RPC error");
+      }, { OPENCODE_BIN: join(fix.root, "missing-opencode") });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[4] returns MCP tool errors without JSON-RPC result/error mixing");
+    const fix = fixture({ opencode: false });
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode", arguments: {} } });
+        const missing = await srv.waitForResponse(2);
+        assert(missing?.result?.isError === true, "missing args uses isError");
+        assert(!missing?.error, "missing args has no JSON-RPC error");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode", arguments: { agent: "missing", prompt: "hi" } } });
+        const unknownAgent = await srv.waitForResponse(3);
+        assert(unknownAgent?.result?.isError === true, "unknown agent uses isError");
+        assert(!("error" in unknownAgent && "result" in unknownAgent), "unknown agent does not mix error and result");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "missing-tool", arguments: {} } });
+        const unknownTool = await srv.waitForResponse(4);
+        assert(unknownTool?.error?.code === -32601, "unknown tool returns JSON-RPC error");
+        assert(!unknownTool?.result, "unknown tool has no result");
+      }, { OPENCODE_BIN: join(fix.root, "missing-opencode") });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[5] resolves short model queries from opencode models");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode", arguments: { list: "models" } } });
+        const listed = await srv.waitForResponse(2);
+        const listText = listed?.result?.content?.[0]?.text || "";
+        assert(listText.includes("deepseek/deepseek-chat"), "models list includes fake DeepSeek model");
+        assert(listText.includes("gemini"), "models list includes discoverable short queries");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode", arguments: { model: "deepseek", prompt: "hi" } } });
+        const deepseek = await srv.waitForResponse(3);
+        assert(deepseek?.result?.content?.[0]?.text?.includes("model=deepseek/deepseek-chat"), "model=deepseek resolves to available DeepSeek model");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode", arguments: { model: "gemini", prompt: "hi" } } });
+        const gemini = await srv.waitForResponse(4);
+        assert(gemini?.result?.content?.[0]?.text?.includes("gemini"), "model=gemini resolves to available Gemini model");
+
+        await srv.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "opencode", arguments: { model: "minimax", prompt: "hi" } } });
+        const minimax = await srv.waitForResponse(5);
+        assert(minimax?.result?.content?.[0]?.text?.includes("model=minimax/MiniMax-M3"), "model=minimax resolves to available MiniMax model");
+
+        await srv.send({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "opencode", arguments: { model: "claude", prompt: "hi" } } });
+        const claude = await srv.waitForResponse(6);
+        assert(claude?.result?.content?.[0]?.text?.includes("model=anthropic/claude-sonnet-4-5"), "model=claude resolves to available Claude Sonnet model");
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[6] resolves dynamic modes from config");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode", arguments: { mode: "sco", prompt: "hi" } } });
+        const res = await srv.waitForResponse(2);
+        assert(res?.result?.content?.[0]?.text?.includes("agent=scout"), "mode=sco resolves to scout dynamically");
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[7] proxies child MCPs and handles tool name collisions");
+    const fix = fixture({ mcps: true });
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        const listed = await srv.waitForResponse(2);
+        const names = listed?.result?.tools?.map(t => t.name) || [];
+        assert(names.includes("echo"), "first child MCP tool keeps original name");
+        assert(names.includes("beta_echo"), "second colliding child MCP tool is prefixed");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "beta_echo", arguments: { value: "ok" } } });
+        const called = await srv.waitForResponse(3);
+        assert(called?.result?.content?.[0]?.text === "beta:echo:ok:initialized=true", "prefixed tool forwards to original child tool after initialized notification");
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[8] shutdown");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "shutdown", params: {} });
+        const res = await srv.waitForResponse(2);
+        assert(res?.result === null, "shutdown returns null");
+        assert(!res?.error, "shutdown has no error");
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
   const total = passed + failed;
-  console.log(`\n\x1b[1m${failed > 0 ? "\x1b[31m" : "\x1b[32m"}${passed}/${total} tests passed\x1b[0m`);
+  console.log(`\n${passed}/${total} tests passed`);
   if (errors.length > 0) {
-    console.log("\n\x1b[31mFailures:\x1b[0m");
-    errors.forEach((e) => console.log(`  • ${e}`));
+    console.log("\nFailures:");
+    for (const error of errors) console.log(`  - ${error}`);
   }
   process.exit(failed > 0 ? 1 : 0);
 }
 
 run().catch((e) => {
-  console.error("\x1b[31mSuite error:\x1b[0m", e.message);
+  console.error("Suite error:", e);
   process.exit(1);
 });

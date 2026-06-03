@@ -39,7 +39,7 @@ from GitHub, extracts it to `~/.opencode-mcp`, and prints next steps. No npm, no
 
 ```bash
 # Download the release zip
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v4.1.0/opencode-mcp-v4.1.0.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.2.0/opencode-mcp-v5.2.0.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 mv ~/opencode-mcp ~/.opencode-mcp
@@ -51,7 +51,7 @@ The entire MCP server is one self-contained file:
 
 ```bash
 mkdir -p ~/.opencode-mcp/src
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v4.1.0/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.2.0/src/index.mjs \
   -o ~/.opencode-mcp/src/index.mjs
 ```
 
@@ -103,7 +103,7 @@ You should see the initialize response followed by your agents list.
 
 Once the MCP server is registered, the Codex AI (GPT-5.5 by default) can call the `opencode` tool. You can ask:
 
-> *"Use the ultra agent to review this file"*
+> *"Use my review mode to review this file"*
 > 
 > *"Ask DeepSeek chat to explain this code"*
 > 
@@ -120,11 +120,11 @@ Same principle — Claude can call `opencode` to delegate tasks to DeepSeek, Gem
 If your MCP client supports explicit tool calls, the schema is:
 
 ```json
-// Run agent with full directives
-{ "agent": "build", "prompt": "Implement a REST endpoint" }
+// Run an agent/mode from your opencode config
+{ "mode": "review", "prompt": "Review this API" }
 
-// Direct model chat
-{ "model": "gemini/gemini-2.5-flash", "prompt": "What's new in ES2025?" }
+// Direct model chat. Short queries are resolved from `opencode models`.
+{ "model": "gemini", "prompt": "What's new in ES2025?" }
 
 // List resources
 { "list": "agents" }

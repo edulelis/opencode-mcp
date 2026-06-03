@@ -9,7 +9,7 @@ on:
     paths-ignore: ["**.md"]
 
 jobs:
-  test-quick:
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -22,5 +22,5 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Test server initialisation (no opencode needed)
-        run: node tests/test.mjs --quick
+      - name: Run hermetic MCP test suite
+        run: npm test

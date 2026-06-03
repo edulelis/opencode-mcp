@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.2.0 (2026-06-03)
+
+- **Dynamic model queries**: Short model names such as `deepseek`, `gemini`, `minimax`, `claude`, `gpt`, `flash`, and `pro` are resolved from the live `opencode models` output instead of hardcoded model IDs.
+- **Dynamic modes**: `mode` is now accepted as an alias for `agent`, and agent/mode names are resolved from `opencode.jsonc` with exact or unique partial matching.
+- **Portable schema**: Agent names are no longer emitted as a hardcoded JSON schema enum, so custom user modes work without code changes.
+- **JSON-RPC correctness**: Tool execution errors now return MCP tool results with `isError: true`; JSON-RPC errors are reserved for protocol-level failures.
+- **Safer process lifecycle**: Removed the global stale-process reaper. The bridge only stops subprocesses that it started itself.
+- **Safer command execution**: Replaced shell-based `execSync` calls with argument-based `execFileSync` calls.
+- **MCP proxy hardening**: Child MCP startup now sends `notifications/initialized`, cleans up failed subprocesses, rejects pending calls if a child exits, and prefixes colliding tool names.
+- **Clean output by default**: Reasoning parts are no longer included in returned text unless `OPENCODE_INCLUDE_REASONING=1` is set.
+- **Hermetic tests**: The test suite now uses fake opencode and fake MCP fixtures, so CI does not depend on local credentials or a real opencode install.
+
 ## 5.1.0 (2026-06-02)
 
 - **Timeout fixes**: Replaced hardcoded 120s/180s limits with configurable `OPENCODE_TOOL_TIMEOUT_MS` (default 10 min) and `OPENCODE_PROXY_TIMEOUT_MS` (default 5 min). Critical for DeepSeek Reasoner which needs 3–5 min for complex reviews.

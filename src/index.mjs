@@ -17,29 +17,34 @@
  *   OPENCODE_MCP_SKIP         comma-sep MCP names            (default: none)
  *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
+ *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
+ *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
  *   DEBUG                     set "1" for verbose logs
  */
 
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
+const VERSION = "5.2.0";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
-  if (process.env.OPENCODE_BIN && existsSync(process.env.OPENCODE_BIN)) return process.env.OPENCODE_BIN;
+  if (Object.prototype.hasOwnProperty.call(process.env, "OPENCODE_BIN")) {
+    return process.env.OPENCODE_BIN && existsSync(process.env.OPENCODE_BIN) ? process.env.OPENCODE_BIN : null;
+  }
   for (const p of [
     join(homedir(), ".opencode", "bin", "opencode"),
     join(homedir(), ".local", "bin", "opencode"),
     "/usr/local/bin/opencode",
     "/opt/homebrew/bin/opencode",
   ]) if (existsSync(p)) return p;
-  try { return execSync("which opencode 2>/dev/null", { encoding: "utf-8" }).trim(); } catch { return null; }
+  try { return execFileSync("which", ["opencode"], { encoding: "utf-8" }).trim(); } catch { return null; }
 }
 
 function findConfig() {
@@ -76,14 +81,16 @@ const AUTH = "Basic " + Buffer.from("opencode:" + PASSWORD).toString("base64");
 const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
 const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
+const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
+const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
+const INCLUDE_REASONING = process.env.OPENCODE_INCLUDE_REASONING === "1";
 
 const AGENTS = CFG.agent
   ? Object.entries(CFG.agent).map(([n, d]) => ({ name: n, description: (d.description || n).split("\n")[0].slice(0, 120), model: d.model || "default" }))
   : [];
 
-if (!OPENCODE_BIN) {
-  console.error("❌ opencode binary not found. Install: curl -fsSL https://opencode.ai/install | sh");
-  process.exit(1);
+function normalizeName(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
 // ─── MCP Client — proxies a child MCP server ───────────────────────────────
@@ -112,6 +119,14 @@ class MCPClient {
         this.proc = proc;
 
         let initResolved = false;
+        const finish = (ready) => {
+          if (initResolved) return;
+          initResolved = true;
+          this.ready = !!ready;
+          this.failed = !ready;
+          if (!ready) this.stop();
+          resolve();
+        };
 
         proc.stdout.on("data", (chunk) => {
           this.buffer += chunk.toString();
@@ -123,53 +138,71 @@ class MCPClient {
             try {
               const msg = JSON.parse(t);
               this._handleMessage(msg);
-            } catch {}
+            } catch (e) {
+              log(`Ignoring non-JSON output from MCP "${this.name}": ${e.message}`);
+            }
           }
         });
 
-        proc.stderr.on("data", () => {}); // ignore stderr
+        proc.stderr.on("data", (chunk) => {
+          log(`MCP "${this.name}" stderr: ${chunk.toString().trim()}`);
+        });
         proc.on("error", (err) => {
           this.failed = true;
-          if (!initResolved) { initResolved = true; resolve(); }
+          for (const pending of this.pending.values()) {
+            clearTimeout(pending.timeout);
+            pending.reject(err);
+          }
+          this.pending.clear();
+          finish(false);
         });
-        proc.on("exit", () => {
-          if (!initResolved) { this.failed = true; initResolved = true; resolve(); }
+        proc.on("exit", (code) => {
+          this.ready = false;
+          this.failed = true;
+          const err = new Error(`MCP "${this.name}" exited with code ${code}`);
+          for (const pending of this.pending.values()) {
+            clearTimeout(pending.timeout);
+            pending.reject(err);
+          }
+          this.pending.clear();
+          finish(false);
         });
 
         // Send initialize
         this._send({ jsonrpc: "2.0", id: this._nextId(), method: "initialize", params: {
           protocolVersion: "2024-11-05", capabilities: {},
-          clientInfo: { name: "opencode-mcp-hub", version: "5.1.0" },
+          clientInfo: { name: "opencode-mcp-hub", version: VERSION },
         }});
 
         // Wait for initialize response, then list tools
         const timeout = setTimeout(() => {
-          if (!initResolved) { initResolved = true; this.failed = true; resolve(); }
+          finish(false);
         }, 10000);
 
         // Override _handleMessage temporarily to catch init
         const origHandler = this._handleMessage.bind(this);
         this._handleMessage = (msg) => {
           if (msg.id === 1 && msg.result) {
-            // Init done — now list tools
+            // Init done — notify readiness, then list tools.
+            this._send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
             this._send({ jsonrpc: "2.0", id: this._nextId(), method: "tools/list", params: {} });
           }
           if (msg.id === 2 && msg.result) {
             this.tools = msg.result.tools || [];
-            this.ready = true;
-            this.failed = false;
             clearTimeout(timeout);
-            initResolved = true;
             this._handleMessage = origHandler;
-            // Re-process any buffered messages
-            resolve();
+            finish(true);
+          }
+          if ((msg.id === 1 || msg.id === 2) && msg.error) {
+            clearTimeout(timeout);
+            this._handleMessage = origHandler;
+            finish(false);
           }
           origHandler(msg);
         };
 
       } catch (err) {
-        this.failed = true;
-        resolve();
+        finish(false);
       }
     });
   }
@@ -193,6 +226,9 @@ class MCPClient {
   }
 
   async callTool(name, args) {
+    if (!this.ready || this.proc?.exitCode != null) {
+      throw new Error(`MCP "${this.name}" is not available`);
+    }
     const id = this._nextId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -208,7 +244,9 @@ class MCPClient {
   stop() {
     try {
       this._send({ jsonrpc: "2.0", id: this._nextId(), method: "shutdown", params: {} });
-      setTimeout(() => this.proc?.kill(), 1000);
+      setTimeout(() => {
+        if (this.proc?.exitCode == null) this.proc?.kill();
+      }, 1000);
     } catch {}
   }
 }
@@ -223,10 +261,13 @@ class OpencodeHub {
     this._openServerProc = null;
     this._openServerUrl = null;
     this._openServerStarting = null;
+    this._openServerExitCode = null;
+    this._modelCache = { at: 0, text: "", models: [] };
 
     // Proxied MCP backends
     this._mcpClients = []; // MCPClient[]
-    this._toolBackend = {}; // toolName -> 'opencode' | 'mcp:<name>'
+    this._proxiedTools = [];
+    this._toolBackend = {}; // exposed tool name -> { clientName, originalName }
     this._hubReady = false;
   }
 
@@ -235,20 +276,35 @@ class OpencodeHub {
   async _ensureOpencode() {
     if (this._openServerUrl) return;
     if (this._openServerStarting) return this._openServerStarting;
+    if (!OPENCODE_BIN) {
+      throw new Error("opencode binary not found. Install it with: curl -fsSL https://opencode.ai/install | sh");
+    }
 
     log("Starting opencode serve...");
     this._openServerStarting = new Promise((resolve, reject) => {
+      let settled = false;
       const proc = spawn(OPENCODE_BIN, ["serve", "--port=0", "--hostname=127.0.0.1"], {
         stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, FORCE_COLOR: "0" },
       });
       let out = "";
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        this._openServerStarting = null;
+        try {
+          if (proc.exitCode == null) proc.kill();
+        } catch {}
+        reject(err);
+      };
       const onData = (chunk) => {
         if (this._openServerUrl) return;
         out += chunk.toString();
         const m = out.match(/opencode server listening on (https?:\/\/[^\s]+)/);
         if (m) {
+          settled = true;
           this._openServerUrl = m[1];
           this._openServerProc = proc;
+          this._openServerExitCode = null;
           this._openServerStarting = null;
           log("Opencode ready:", this._openServerUrl);
           resolve();
@@ -256,9 +312,19 @@ class OpencodeHub {
       };
       proc.stdout.on("data", onData);
       proc.stderr.on("data", onData);
-      proc.on("exit", (code) => { if (!this._openServerUrl) { this._openServerStarting = null; reject(new Error(`Opencode exit ${code}`)); }});
-      proc.on("error", (e) => { this._openServerStarting = null; reject(e); });
-      setTimeout(() => { if (!this._openServerUrl) { this._openServerStarting = null; reject(new Error("Opencode start timeout")); }}, 15000);
+      proc.on("exit", (code) => {
+        if (!settled) {
+          fail(new Error(`Opencode exited before it was ready with code ${code}`));
+          return;
+        }
+        this._openServerExitCode = code;
+        this._openServerProc = null;
+        this._openServerUrl = null;
+      });
+      proc.on("error", fail);
+      setTimeout(() => {
+        if (!settled) fail(new Error("Opencode start timeout"));
+      }, 15000);
     });
     return this._openServerStarting;
   }
@@ -266,6 +332,7 @@ class OpencodeHub {
   _stopOpencode() {
     if (this._openServerProc) { this._openServerProc.kill(); this._openServerProc = null; }
     this._openServerUrl = null;
+    this._openServerExitCode = null;
   }
 
   async _api(method, path, body, queryParams) {
@@ -280,8 +347,9 @@ class OpencodeHub {
       headers: { "Content-Type": "application/json", Authorization: AUTH },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 500)}`);
-    return resp.json();
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) throw new Error(`API ${resp.status}: ${text.slice(0, 500)}`);
+    return text ? JSON.parse(text) : null;
   }
 
   _parseModel(modelStr) {
@@ -289,6 +357,120 @@ class OpencodeHub {
     const idx = modelStr.indexOf("/");
     if (idx === -1) return { providerID: modelStr, modelID: modelStr };
     return { providerID: modelStr.slice(0, idx), modelID: modelStr.slice(idx + 1) };
+  }
+
+  _modelsText() {
+    if (!OPENCODE_BIN) {
+      throw new Error("opencode binary not found. Install it with: curl -fsSL https://opencode.ai/install | sh");
+    }
+    return execFileSync(OPENCODE_BIN, ["models"], {
+      encoding: "utf-8",
+      timeout: 15000,
+      env: { ...process.env, FORCE_COLOR: "0" },
+    });
+  }
+
+  _parseModels(text) {
+    const matches = text.match(/[A-Za-z0-9._-]+\/[A-Za-z0-9._:-]+/g) || [];
+    return [...new Set(matches.map(m => m.trim()).filter(Boolean))];
+  }
+
+  _availableModels(force = false) {
+    const now = Date.now();
+    if (!force && this._modelCache.models.length && now - this._modelCache.at < MODEL_CACHE_MS) {
+      return this._modelCache;
+    }
+    const text = this._modelsText();
+    const models = this._parseModels(text);
+    this._modelCache = { at: now, text, models };
+    return this._modelCache;
+  }
+
+  _scoreModel(model, query) {
+    const lower = model.toLowerCase();
+    const [provider, modelID = ""] = lower.split("/");
+    const q = query.toLowerCase();
+
+    let score = 0;
+    if (provider === q) score += 600;
+    if (modelID === q) score += 500;
+    if (provider.includes(q)) score += 300;
+    if (modelID.includes(q)) score += 250;
+    if (lower.includes(q)) score += 100;
+    if (!lower.includes("-free")) score += 20;
+    if (lower.includes("latest")) score += 12;
+    if (lower.includes("flash") || lower.includes("highspeed")) score += 8;
+    if (lower.includes("chat") || lower.includes("sonnet") || lower.includes("m3")) score += 6;
+    if ((q === "deepseek" || q === "chat") && lower.includes("chat")) score += 30;
+    if ((q === "claude" || q === "anthropic") && lower.includes("sonnet")) score += 60;
+    if ((q === "claude" || q === "anthropic") && lower.includes("opus")) score += 40;
+    if ((q === "openai" || q === "gpt") && !lower.includes("mini")) score += 20;
+    if (q === "minimax" && lower.includes("m3")) score += 20;
+    return score;
+  }
+
+  _resolveModelFromList(modelStr, models) {
+    const wanted = String(modelStr || "").trim();
+    if (!wanted) return wanted;
+    const lower = wanted.toLowerCase();
+
+    const exact = models.find(m => m.toLowerCase() === lower);
+    if (exact) return exact;
+    if (wanted.includes("/")) return wanted;
+
+    const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
+    const candidates = models.filter((m) => {
+      const ml = m.toLowerCase();
+      const provider = ml.split("/")[0];
+      return provider === lower || ml.includes(lower) || (tokens.length > 1 && tokens.every(t => ml.includes(t)));
+    });
+
+    if (!candidates.length) return wanted;
+    return candidates
+      .map(m => ({ model: m, score: this._scoreModel(m, lower) }))
+      .sort((a, b) => b.score - a.score || a.model.localeCompare(b.model))[0].model;
+  }
+
+  _resolveModelAlias(modelStr) {
+    const wanted = String(modelStr || "").trim();
+    if (!wanted || wanted.includes("/")) return wanted;
+    try {
+      return this._resolveModelFromList(wanted, this._availableModels().models);
+    } catch (e) {
+      return wanted;
+    }
+  }
+
+  _formatModelsList() {
+    const { text, models } = this._availableModels(true);
+    const noisyAliases = new Set(["free", "preview", "latest"]);
+    const discoveredAliases = [...new Set(models.flatMap((m) => {
+      const [provider, modelID = ""] = m.split("/");
+      return [provider, ...modelID.split(/[^A-Za-z0-9]+/)]
+        .map(s => s.toLowerCase())
+        .filter(s => s && s.length >= 3 && /[a-z]/.test(s) && !noisyAliases.has(s));
+    }))].sort((a, b) => a.localeCompare(b));
+
+    if (!discoveredAliases.length) return text;
+    return `${text.trim()}\n\n# You can also use short model queries\n${discoveredAliases.slice(0, 80).join(", ")}\n`;
+  }
+
+  _resolveAgent(agentName) {
+    const wanted = String(agentName || "").trim();
+    if (!wanted || !AGENTS.length) return { name: wanted, ambiguous: [], found: true };
+
+    const lower = normalizeName(wanted);
+    const exact = AGENTS.find(a => normalizeName(a.name) === lower);
+    if (exact) return { name: exact.name, ambiguous: [], found: true };
+
+    const candidates = AGENTS.filter((a) => {
+      const name = normalizeName(a.name);
+      const desc = normalizeName(a.description);
+      return name.includes(lower) || desc.includes(lower);
+    });
+    if (candidates.length === 1) return { name: candidates[0].name, ambiguous: [], found: true };
+    if (candidates.length > 1) return { name: wanted, ambiguous: candidates.map(a => a.name), found: false };
+    return { name: wanted, ambiguous: [], found: false };
   }
 
   async _opencodeCall(agent, model, prompt, directory) {
@@ -303,7 +485,11 @@ class OpencodeHub {
       parts: [{ type: "text", text: prompt }],
     };
     if (agent) msgBody.agent = agent;
-    if (model) msgBody.model = this._parseModel(model);
+    if (model) {
+      const resolvedModel = this._resolveModelAlias(model);
+      log(`Resolved model "${model}" -> "${resolvedModel}"`);
+      msgBody.model = this._parseModel(resolvedModel);
+    }
 
     await this._api("POST", `/session/${sid}/message`, msgBody, { directory: dir });
     return this._pollSession(sid, prompt);
@@ -313,18 +499,18 @@ class OpencodeHub {
     const start = Date.now();
     let prev = 0, stable = 0, last = "", lastMsgs = null;
     log(`Polling session ${sid} (max ${TOOL_TIMEOUT}ms)...`);
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, POLL_INTERVAL));
 
     while (Date.now() - start < TOOL_TIMEOUT) {
       // Detect if opencode server process died
-      if (this._openServerProc?.exitCode != null) {
-        const msg = `Opencode server exited with code ${this._openServerProc.exitCode}`;
+      if (this._openServerExitCode != null) {
+        const msg = `Opencode server exited with code ${this._openServerExitCode}`;
         log(msg);
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
         return `Error: ${msg}`;
       }
 
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
 
       let msgs;
       try {
@@ -352,7 +538,7 @@ class OpencodeHub {
       for (const m of msgs) {
         const parts = m.parts;
         const t = parts
-          ? parts.filter(p => (p.type === "text" || p.type === "reasoning") && p.text)
+          ? parts.filter(p => (p.type === "text" || (INCLUDE_REASONING && p.type === "reasoning")) && p.text)
                  .map(p => p.text.trim()).filter(Boolean).join("\n")
           : (m.content || "");
         if (t && t !== prompt) resp = t;
@@ -384,6 +570,15 @@ class OpencodeHub {
 
   // ── Backend: proxied MCPs ────────────────────────────────────────
 
+  _uniqueToolName(baseName) {
+    let name = baseName;
+    let i = 2;
+    while (name === "opencode" || this._toolBackend[name]) {
+      name = `${baseName}_${i++}`;
+    }
+    return name;
+  }
+
   async _startProxiedMcps() {
     const mcpConfig = CFG.mcp || {};
     const skipSet = new Set(SKIP_MCPS);
@@ -407,8 +602,10 @@ class OpencodeHub {
       }
 
       // Check if command exists
-      const cmdPath = cmd.includes("/") ? cmd : (() => { try { return execSync(`which ${cmd} 2>/dev/null`, { encoding: "utf-8" }).trim(); } catch { return null; } })();
-      if (!cmdPath && !cmd.includes("/")) {
+      const cmdPath = cmd.includes("/")
+        ? (existsSync(cmd) ? cmd : null)
+        : (() => { try { return execFileSync("which", [cmd], { encoding: "utf-8" }).trim(); } catch { return null; } })();
+      if (!cmdPath) {
         log(`MCP "${name}" command "${cmd}" not found, skipping`);
         continue;
       }
@@ -420,7 +617,18 @@ class OpencodeHub {
       if (client.ready) {
         this._mcpClients.push(client);
         for (const tool of client.tools) {
-          this._toolBackend[tool.name] = `mcp:${name}`;
+          const collides = tool.name === "opencode" || !!this._toolBackend[tool.name];
+          const exposedName = this._uniqueToolName(collides ? `${name}_${tool.name}` : tool.name);
+          const exposedTool = exposedName === tool.name
+            ? tool
+            : {
+                ...tool,
+                name: exposedName,
+                description: `[${name}:${tool.name}] ${tool.description || ""}`.trim(),
+              };
+          this._proxiedTools.push(exposedTool);
+          this._toolBackend[exposedName] = { clientName: name, originalName: tool.name };
+          if (exposedName !== tool.name) log(`  renamed colliding tool "${tool.name}" -> "${exposedName}"`);
         }
         log(`  → ${client.tools.length} tools from "${name}"`);
       } else {
@@ -449,16 +657,18 @@ class OpencodeHub {
         "MODES:\n" +
         "  1. AGENT — runs agent with full directives\n" +
         "     { \"agent\": \"<name>\", \"prompt\": \"...\" }\n" +
-        "  2. CHAT — direct model call\n" +
+        "     { \"mode\": \"<name>\", \"prompt\": \"...\" } also works\n" +
+        "  2. CHAT — direct model call, with short queries resolved from opencode models\n" +
         "     { \"model\": \"<provider/model>\", \"prompt\": \"...\" }\n" +
         "  3. LIST — list agents or models\n" +
         "     { \"list\": \"agents\" }  or  { \"list\": \"models\" }\n\n" +
-        "Agents: " + (AGENTS.length ? AGENTS.map(a => a.name).join(", ") : "none"),
+        "Configured agents/modes: " + (AGENTS.length ? AGENTS.map(a => a.name).join(", ") : "none"),
       inputSchema: {
         type: "object",
         properties: {
-          agent: { type: "string", description: "Agent name", enum: AGENTS.length ? AGENTS.map(a => a.name) : undefined },
-          model: { type: "string", description: "Model in provider/name format" },
+          agent: { type: "string", description: "Agent name from opencode config. Exact or unique partial names are accepted." },
+          mode: { type: "string", description: "Alias for agent. Exact or unique partial names are accepted." },
+          model: { type: "string", description: "Model in provider/name format, or a short query such as deepseek, gemini, minimax, claude, gpt, flash, pro." },
           prompt: { type: "string", description: "The prompt or task" },
           list: { type: "string", description: "Set to \"agents\" or \"models\"", enum: ["agents", "models"] },
           directory: { type: "string", description: "Working directory" },
@@ -468,11 +678,7 @@ class OpencodeHub {
   }
 
   get _allTools() {
-    const tools = [this._opencodeTool];
-    for (const client of this._mcpClients) {
-      for (const t of client.tools) tools.push(t);
-    }
-    return tools;
+    return [this._opencodeTool, ...this._proxiedTools];
   }
 
   // ── JSON-RPC handlers ─────────────────────────────────────────────
@@ -482,12 +688,10 @@ class OpencodeHub {
 
     switch (method) {
       case "initialize":
-        // Start opencode in background
-        this._ensureOpencode().catch(() => {});
         return this.r(id, {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "opencode-mcp", version: "5.1.0" },
+          serverInfo: { name: "opencode-mcp", version: VERSION },
         });
 
       case "notifications/initialized":
@@ -500,6 +704,7 @@ class OpencodeHub {
 
       case "tools/call":
         await this._waitForMcps();
+        if (!params?.name) return this.r(id, null, { code: -32602, message: "Missing tool name" });
         return this._call(id, params.name, params.arguments || {});
 
       case "shutdown":
@@ -519,21 +724,28 @@ class OpencodeHub {
     try {
       // ── opencode tool ───────────────────────────────────────────
       if (toolName === "opencode") {
-        const { agent, model, prompt, list, directory } = args;
+        const { model, prompt, list, directory } = args;
+        const requestedAgent = args.agent || args.mode;
 
         if (list === "agents") {
           if (!AGENTS.length) return this.r(id, { content: [{ type: "text", text: "No agents found." }] });
-          return this.r(id, { content: [{ type: "text", text: "# Agents\n\n" + AGENTS.map(a => `- **${a.name}**: ${a.description} (model: \`${a.model}\`)`).join("\n") + "\n\nCall: `{ \"agent\": \"<name>\", \"prompt\": \"...\" }`" }] });
+          return this.r(id, { content: [{ type: "text", text: "# Agents\n\n" + AGENTS.map(a => `- **${a.name}**: ${a.description} (model: \`${a.model}\`)`).join("\n") + "\n\nCall: `{ \"agent\": \"<name>\", \"prompt\": \"...\" }` or `{ \"mode\": \"<name>\", \"prompt\": \"...\" }`" }] });
         }
         if (list === "models") {
-          try { const out = execSync(`${OPENCODE_BIN} models`, { encoding: "utf-8", timeout: 15000 }); return this.r(id, { content: [{ type: "text", text: out }] }); }
-          catch (e) { return this.r(id, { content: [{ type: "text", text: `Error listing models: ${e.message}` }] }, `Model list failed: ${e.message}`); }
+          try { return this.r(id, { content: [{ type: "text", text: this._formatModelsList() }] }); }
+          catch (e) { return this.toolError(id, `Error listing models: ${e.message}`); }
         }
-        if (!prompt) return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, "Missing prompt");
-        if (agent) {
-          if (AGENTS.length && !AGENTS.find(a => a.name === agent)) return this.r(id, { content: [{ type: "text", text: `Agent "${agent}" not found. Available: ${AGENTS.map(a => a.name).join(", ")}` }] }, `Agent "${agent}" not found`);
-          log(`Run agent: ${agent}`);
-          const result = await this._opencodeCall(agent, null, prompt, directory);
+        if (!prompt) return this.toolError(id, "Provide agent+prompt, mode+prompt, model+prompt, or list.");
+        if (requestedAgent) {
+          const resolvedAgent = this._resolveAgent(requestedAgent);
+          if (!resolvedAgent.found) {
+            if (resolvedAgent.ambiguous.length) {
+              return this.toolError(id, `Agent/mode "${requestedAgent}" is ambiguous. Matches: ${resolvedAgent.ambiguous.join(", ")}`);
+            }
+            return this.toolError(id, `Agent/mode "${requestedAgent}" not found. Available: ${AGENTS.map(a => a.name).join(", ") || "(opencode will decide if config is unavailable)"}`);
+          }
+          log(`Run agent: ${resolvedAgent.name}`);
+          const result = await this._opencodeCall(resolvedAgent.name, null, prompt, directory);
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
         if (model) {
@@ -541,20 +753,20 @@ class OpencodeHub {
           const result = await this._opencodeCall(null, model, prompt, directory);
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
-        return this.r(id, { content: [{ type: "text", text: "Provide agent+prompt, model+prompt, or list." }] }, "Missing agent or model");
+        return this.toolError(id, "Provide agent+prompt, mode+prompt, model+prompt, or list.");
       }
 
       // ── Proxied MCP tool ────────────────────────────────────────
       const backend = this._toolBackend[toolName];
-      if (backend?.startsWith("mcp:")) {
-        const mcpName = backend.slice(4);
+      if (backend) {
+        const { clientName: mcpName, originalName } = backend;
         const client = this._mcpClients.find(c => c.name === mcpName);
         if (!client) return this.r(id, null, { code: -32602, message: `Backend "${mcpName}" not available` });
 
-        log(`Forwarding "${toolName}" to MCP "${mcpName}"`);
-        const result = await client.callTool(toolName, args);
-        if (!result) return this.r(id, { content: [{ type: "text", text: `No response from MCP "${mcpName}"` }] }, `MCP "${mcpName}" returned empty`);
-        if (result.error) return this.r(id, { content: [{ type: "text", text: `MCP "${mcpName}" error: ${JSON.stringify(result.error)}` }] }, `MCP "${mcpName}" tool error`);
+        log(`Forwarding "${toolName}" to MCP "${mcpName}" as "${originalName}"`);
+        const result = await client.callTool(originalName, args);
+        if (!result) return this.toolError(id, `No response from MCP "${mcpName}"`);
+        if (result.error) return this.toolError(id, `MCP "${mcpName}" error: ${JSON.stringify(result.error)}`);
         return this.r(id, result.result || { content: [{ type: "text", text: "(empty)" }] });
       }
 
@@ -562,7 +774,7 @@ class OpencodeHub {
 
     } catch (e) {
       log("Error:", e.message);
-      return this.r(id, { content: [{ type: "text", text: `Error: ${e.message}` }] }, `Tool call failed: ${e.message}`);
+      return this.toolError(id, `Error: ${e.message}`);
     }
   }
 
@@ -570,15 +782,24 @@ class OpencodeHub {
     this._stopOpencode();
     for (const c of this._mcpClients) c.stop();
     this._mcpClients = [];
+    this._proxiedTools = [];
     this._toolBackend = {};
+    this._mcpsStarted = null;
+  }
+
+  toolError(id, text) {
+    return this.r(id, { content: [{ type: "text", text }], isError: true });
   }
 
   r(id, result, error) {
     const m = { jsonrpc: "2.0", id };
     if (error) {
-      const msg = typeof error === "string" ? error : (error?.message || error?.toString?.() || "unknown error");
-      m.error = { code: -1, message: msg };
-      if (result) m.result = result;
+      if (typeof error === "object" && error?.code) {
+        m.error = error;
+      } else {
+        const msg = typeof error === "string" ? error : (error?.message || error?.toString?.() || "unknown error");
+        m.error = { code: -1, message: msg };
+      }
     } else {
       m.result = result;
     }
@@ -614,31 +835,13 @@ class OpencodeHub {
   _exit() { this._stopAll(); setTimeout(() => process.exit(0), 100); }
 }
 
-// ─── Zombie reaper: kill stale opencode serve processes from previous runs ───
-function killStaleOpencode() {
-  try {
-    // Use ps aux for cross-platform (macOS + Linux)
-    const out = execSync(`ps aux | grep "[o]pencode serve" || true`, { encoding: "utf-8" });
-    const lines = out.trim().split("\n").filter(Boolean);
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/);
-      const pid = parseInt(parts[1]);
-      if (pid && pid !== process.pid) {
-        try { process.kill(pid, "SIGTERM"); log(`Killed stale opencode serve pid=${pid}`); } catch {}
-      }
-    }
-  } catch {}
-}
-
 // ─── Boot ──────────────────────────────────────────────────────────────────
-killStaleOpencode();
-
 const mcpList = CFG.mcp ? Object.keys(CFG.mcp).filter(k => CFG.mcp[k].enabled !== false) : [];
 const skipSet = new Set((process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean));
 const activeMcps = mcpList.filter(n => !skipSet.has(n));
 
-console.error(`opencode-mcp v5.1.0 — MCP hub`);
-console.error(`  opencode:      ${OPENCODE_BIN}`);
+console.error(`opencode-mcp v${VERSION} — MCP hub`);
+console.error(`  opencode:      ${OPENCODE_BIN || "(not found; install opencode for model calls)"}`);
 console.error(`  agents:        ${AGENTS.length} found`);
 console.error(`  tool timeout:  ${(TOOL_TIMEOUT / 1000).toFixed(0)}s`);
 console.error(`  proxy timeout: ${(PROXY_TIMEOUT / 1000).toFixed(0)}s`);

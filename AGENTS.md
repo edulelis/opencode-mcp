@@ -23,29 +23,29 @@ The hub reads the `mcp` config from `opencode.jsonc`, starts each enabled MCP se
 ## Key Components
 
 ### `OpencodeHub` class
-- `_ensureOpencode()` — starts `opencode serve` as HTTP backend
+- `_ensureOpencode()` — lazily starts `opencode serve` as HTTP backend
 - `_startProxiedMcps()` — spawns child MCP servers from opencode.jsonc's `mcp` section
 - `_waitForMcps()` — waits up to 8s for child MCPs to initialize
 - `_allTools` — merges opencode tool + all proxied MCP tools
-- `_toolBackend` — maps tool names to backend IDs
+- `_toolBackend` — maps exposed tool names to `{ clientName, originalName }`
 
 ### `MCPClient` class
 - Wraps a child MCP server subprocess
 - Speaks JSON-RPC 2.0 over stdio
-- `start()` — sends `initialize` + `tools/list` to discover tools
+- `start()` — sends `initialize`, `notifications/initialized`, and `tools/list` to discover tools
 - `callTool(name, args)` — sends `tools/call` and waits for response
 - `stop()` — sends `shutdown` and kills process
 
 ## Tool Routing
 
-The `opencode` tool is handled directly by the hub (routes to opencode serve HTTP API). All other tool names (e.g., `dbt_debate`, `codex`) are looked up in `_toolBackend` and forwarded to the appropriate MCPClient.
+The `opencode` tool is handled directly by the hub (routes to opencode serve HTTP API). All other tool names are looked up in `_toolBackend` and forwarded to the appropriate MCPClient using the child tool's original name. Colliding tool names are prefixed with the child MCP name.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `src/index.mjs` | **Single-file hub** — entire MCP server in one file |
-| `tests/test.mjs` | Test suite (18 tests, quick + full modes) |
+| `tests/test.mjs` | Hermetic test suite with fake opencode and fake MCP fixtures |
 | `.github/workflows/test.yml` | CI on push (Node 18/20/22) |
 | `scripts/setup.sh` | One-command install from GitHub release |
 
