@@ -105,7 +105,7 @@ Once the MCP server is registered, Codex can call the generic `opencode` tool or
 
 > *"Use my review mode to review this file"*
 > 
-> *"Use DeepSeek and answer oi"*
+> *"Use DeepSeek and say hello"*
 > 
 > *"Ask Gemini to summarize this file"*
 > 
@@ -132,7 +132,7 @@ If your MCP client supports explicit tool calls, the schema is:
 
 // Dynamic provider/family shortcut generated from `opencode models`.
 // Tool name example: opencode_model_deepseek
-{ "prompt": "Say oi" }
+{ "prompt": "Say hello" }
 
 // List resources
 { "list": "agents" }

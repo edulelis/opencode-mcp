@@ -62,7 +62,7 @@ The bridge exposes a primary MCP tool called **`opencode`** plus dynamic model s
 
 After registering the MCP server in Codex, you can ask for opencode models directly:
 
-> "Use DeepSeek and answer oi"
+> "Use DeepSeek and say hello"
 >
 > "Ask Gemini to summarize this file"
 >
@@ -106,7 +106,7 @@ Calls any model directly. Full model IDs still work, but short queries are resol
 Examples:
 
 ```json
-{ "model": "deepseek", "prompt": "Say oi" }
+{ "model": "deepseek", "prompt": "Say hello" }
 { "model": "gemini", "prompt": "Summarize this" }
 { "model": "minimax", "prompt": "Draft release notes" }
 { "model": "claude", "prompt": "Review this API" }
@@ -128,11 +128,11 @@ opencode_model_openai
 opencode_model_gpt
 ```
 
-The exact tools depend on your opencode model list. These shortcuts default to **no project context**, which makes requests like "call DeepSeek and ask oi" easier for MCP clients to route without leaking the current repo context.
+The exact tools depend on your opencode model list. These shortcuts default to **no project context**, which makes requests like "call DeepSeek and say hello" easier for MCP clients to route without leaking the current repo context.
 
 ```json
 {
-  "prompt": "Say oi"
+  "prompt": "Say hello"
 }
 ```
 
