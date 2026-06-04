@@ -57,3 +57,4 @@ The `opencode` tool is handled directly by the hub (routes to opencode serve HTT
 3. **Auto-discovery** — reads `mcp` from opencode.jsonc automatically
 4. **Graceful degradation** — if a child MCP fails to start, log and skip
 5. **All tools merged** — `tools/list` returns union of all backends
+6. **Natural model routing** — clients such as Codex should be able to route prompts like "use DeepSeek" or "ask Gemini" from the dynamic `opencode_model_*` tools without hardcoded provider names

@@ -58,6 +58,20 @@ codex mcp add opencode-mcp -- node ~/.opencode-mcp/src/index.mjs
 
 The bridge exposes a primary MCP tool called **`opencode`** plus dynamic model shortcut tools.
 
+### From Codex in natural language
+
+After registering the MCP server in Codex, you can ask for opencode models directly:
+
+> "Use DeepSeek and answer oi"
+>
+> "Ask Gemini to summarize this file"
+>
+> "Call MiniMax to draft release notes"
+>
+> "Use plan mode to sketch the implementation"
+
+Codex sees the live MCP tool list and can route those requests to dynamic tools such as `opencode_model_deepseek`, `opencode_model_gemini`, or `opencode_model_minimax`. Provider shortcuts use **no project context by default**; ask for a repository review or set `context: "cwd"` only when the model should see the current working directory.
+
 ### 1. Run an agent (with all directives)
 
 ```json

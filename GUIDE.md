@@ -101,15 +101,19 @@ You should see the initialize response followed by your agents list.
 
 ### From Codex Desktop
 
-Once the MCP server is registered, the Codex AI (GPT-5.5 by default) can call the `opencode` tool. You can ask:
+Once the MCP server is registered, Codex can call the generic `opencode` tool or the dynamic provider/family shortcut tools generated from your live `opencode models` output. You can ask:
 
 > *"Use my review mode to review this file"*
 > 
-> *"Ask DeepSeek chat to explain this code"*
+> *"Use DeepSeek and answer oi"*
+> 
+> *"Ask Gemini to summarize this file"*
+> 
+> *"Call MiniMax to draft release notes"*
 > 
 > *"List my available opencode agents"*
 
-The AI will automatically choose the right tool mode based on your request.
+The AI will automatically choose the right tool based on your request. For example, "Use DeepSeek" can route to `opencode_model_deepseek`, while "use plan mode" can route through the generic `opencode` tool with `mode: "plan"`.
 
 ### From Claude Desktop
 
