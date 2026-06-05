@@ -106,7 +106,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/session") {
     const id = "s" + nextSession++;
-    sessions.set(id, { response: "", directory: url.searchParams.get("directory") || "" });
+    sessions.set(id, { response: "", directory: url.searchParams.get("directory") || "", readyAt: 0 });
     return send(res, 200, { id });
   }
 
@@ -127,13 +127,17 @@ const server = http.createServer(async (req, res) => {
       session.response = "chat dir=" + session.directory + " OK";
     }
     session.prompt = prompt;
+    session.readyAt = prompt.includes("slow-response") ? Date.now() + 180 : Date.now();
     return send(res, 200, { id: "m1" });
   }
 
   if (req.method === "GET" && url.pathname.endsWith("/message")) {
+    const assistantParts = Date.now() >= session.readyAt
+      ? [{ type: "text", text: session.response || "" }]
+      : [];
     return send(res, 200, [
       { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
-      { info: { role: "assistant" }, parts: [{ type: "text", text: session.response || "" }] }
+      { info: { role: "assistant" }, parts: assistantParts }
     ]);
   }
 
@@ -315,11 +319,15 @@ async function run() {
         await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
         const res = await srv.waitForResponse(2);
         const tool = res?.result?.tools?.find(t => t.name === "opencode");
+        const jobTool = res?.result?.tools?.find(t => t.name === "opencode_job");
         const names = res?.result?.tools?.map(t => t.name) || [];
         assert(!!tool, "opencode tool is listed");
+        assert(!!jobTool, "opencode_job tool is listed");
         assert(!!tool?.inputSchema?.properties?.agent, "schema supports agent");
         assert(!!tool?.inputSchema?.properties?.mode, "schema supports mode");
         assert(!!tool?.inputSchema?.properties?.model, "schema supports model");
+        assert(!!tool?.inputSchema?.properties?.background, "schema supports background jobs");
+        assert(!!tool?.inputSchema?.properties?.wait_ms, "schema supports synchronous wait budget");
         assert(!tool?.inputSchema?.properties?.agent?.enum, "agent names are not hardcoded as schema enum");
         assert(names.includes("opencode_model_deepseek"), "dynamic DeepSeek provider tool is listed");
         assert(names.includes("opencode_model_google"), "dynamic Google provider tool is listed");
@@ -485,7 +493,35 @@ async function run() {
   }
 
   {
-    console.log("\n[9] shutdown");
+    console.log("\n[9] returns pollable jobs before client timeouts");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "slow-response please", wait_ms: 60 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "slow model call returns running job instead of blocking");
+        assert(!!jobId, "running job response includes job_id");
+
+        await new Promise(r => setTimeout(r, 220));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(3);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("model=deepseek/deepseek-chat"), "opencode_job status returns completed model output");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "list" } } });
+        const listed = await srv.waitForResponse(4);
+        const listedText = listed?.result?.content?.[0]?.text || "";
+        assert(listedText.includes('"jobs": []'), "completed job is removed from job list");
+      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[10] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

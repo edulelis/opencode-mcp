@@ -16,6 +16,8 @@
  *   OPENCODE_SERVER_PASSWORD  for opencode serve             (default: env value)
  *   OPENCODE_MCP_SKIP         comma-sep MCP names            (default: none)
  *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
+ *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 60000)
+ *   OPENCODE_API_TIMEOUT_MS   max wait for one opencode HTTP call (default: 10000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -81,6 +83,8 @@ const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
 const AUTH = "Basic " + Buffer.from("opencode:" + PASSWORD).toString("base64");
 const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
 const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
+const RETURN_TIMEOUT = parseInt(process.env.OPENCODE_MCP_RETURN_TIMEOUT_MS) || 60_000;
+const API_TIMEOUT = parseInt(process.env.OPENCODE_API_TIMEOUT_MS) || 10_000;
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
@@ -274,6 +278,7 @@ class OpencodeHub {
     this._modelToolBackend = {};
     this._modelToolCacheKey = "";
     this._emptyContextDir = null;
+    this._jobs = new Map();
 
     // Proxied MCP backends
     this._mcpClients = []; // MCPClient[]
@@ -346,21 +351,32 @@ class OpencodeHub {
     this._openServerExitCode = null;
   }
 
-  async _api(method, path, body, queryParams) {
+  async _api(method, path, body, queryParams, timeoutMs = API_TIMEOUT) {
     await this._ensureOpencode();
     let url = this._openServerUrl + path;
     if (queryParams) {
       const qs = new URLSearchParams(queryParams).toString();
       if (qs) url += "?" + qs;
     }
-    const resp = await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json", Authorization: AUTH },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await resp.text().catch(() => "");
-    if (!resp.ok) throw new Error(`API ${resp.status}: ${text.slice(0, 500)}`);
-    return text ? JSON.parse(text) : null;
+    const requestTimeout = Math.max(1, Number.parseInt(timeoutMs, 10) || API_TIMEOUT);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), requestTimeout);
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json", Authorization: AUTH },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      const text = await resp.text().catch(() => "");
+      if (!resp.ok) throw new Error(`API ${resp.status}: ${text.slice(0, 500)}`);
+      return text ? JSON.parse(text) : null;
+    } catch (e) {
+      if (e?.name === "AbortError") throw new Error(`API timeout after ${requestTimeout}ms: ${method} ${path}`);
+      throw e;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   _parseModel(modelStr) {
@@ -512,6 +528,8 @@ class OpencodeHub {
         model: { type: "string", description: "Optional model ID or short query within this provider/family." },
         context: { type: "string", enum: ["none", "cwd"], default: defaultContext, description: "Use no project context or the current working directory." },
         directory: { type: "string", description: "Explicit working directory. Overrides context when provided." },
+        background: { type: "boolean", description: "Start the opencode session and return a job_id immediately instead of waiting for completion." },
+        wait_ms: { type: "integer", description: "Maximum synchronous wait before returning a pollable job. Clamped by OPENCODE_MCP_RETURN_TIMEOUT_MS." },
       },
     };
   }
@@ -617,7 +635,14 @@ class OpencodeHub {
     return { name: wanted, ambiguous: [], found: false };
   }
 
-  async _opencodeCall(agent, model, prompt, directory, context = "cwd") {
+  _clampedWaitMs(waitMs) {
+    if (waitMs === undefined || waitMs === null || waitMs === "") return RETURN_TIMEOUT;
+    const parsed = Number.parseInt(waitMs, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return RETURN_TIMEOUT;
+    return Math.min(parsed, RETURN_TIMEOUT);
+  }
+
+  async _createOpencodeJob(agent, model, prompt, directory, context = "cwd") {
     await this._ensureOpencode();
     const dir = this._resolveDirectory(directory, context, "cwd");
     // Session create: directory goes in query params
@@ -636,29 +661,76 @@ class OpencodeHub {
     }
 
     await this._api("POST", `/session/${sid}/message`, msgBody, { directory: dir });
-    return this._pollSession(sid, prompt);
+    return {
+      id: sid,
+      sid,
+      agent: agent || null,
+      model: model || null,
+      prompt,
+      directory: dir,
+      createdAt: Date.now(),
+      last: "",
+      lastMessageCount: 0,
+    };
   }
 
-  async _pollSession(sid, prompt) {
-    const start = Date.now();
-    let prev = 0, stable = 0, last = "", lastMsgs = null;
-    log(`Polling session ${sid} (max ${TOOL_TIMEOUT}ms)...`);
-    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+  async _opencodeCall(agent, model, prompt, directory, context = "cwd", options = {}) {
+    const callStart = Date.now();
+    const waitBudget = this._clampedWaitMs(options.waitMs);
+    const job = await this._createOpencodeJob(agent, model, prompt, directory, context);
+    if (options.background) {
+      this._jobs.set(job.id, job);
+      return this._formatRunningJob(job, { elapsed: 0, last: "", reason: "background" });
+    }
 
-    while (Date.now() - start < TOOL_TIMEOUT) {
+    const result = await this._pollSession(job, {
+      maxWaitMs: Math.max(0, waitBudget - (Date.now() - callStart)),
+      deleteOnComplete: true,
+    });
+
+    if (result.status === "complete" || result.status === "timeout") {
+      return result.text;
+    }
+
+    this._jobs.set(job.id, job);
+    return this._formatRunningJob(job, result);
+  }
+
+  async _pollSession(job, options = {}) {
+    const sid = job.sid || job.id;
+    const prompt = job.prompt || "";
+    const maxWaitMs = this._clampedWaitMs(options.maxWaitMs);
+    const deleteOnComplete = options.deleteOnComplete !== false;
+    const start = Date.now();
+    const totalElapsed = () => Date.now() - (job.createdAt || start);
+    let prev = job.lastMessageCount || 0;
+    let stable = 0;
+    let last = job.last || "";
+    log(`Polling session ${sid} (max sync ${maxWaitMs}ms, max total ${TOOL_TIMEOUT}ms)...`);
+
+    if (maxWaitMs <= 0) {
+      return { status: "running", elapsed: totalElapsed(), last, reason: "no_wait" };
+    }
+
+    while (Date.now() - start < maxWaitMs && totalElapsed() < TOOL_TIMEOUT) {
       // Detect if opencode server process died
       if (this._openServerExitCode != null) {
         const msg = `Opencode server exited with code ${this._openServerExitCode}`;
         log(msg);
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
-        return `Error: ${msg}`;
+        this._jobs.delete(job.id);
+        return { status: "timeout", elapsed: totalElapsed(), last, text: `Error: ${msg}` };
       }
 
-      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+      const remainingBeforeSleep = Math.min(maxWaitMs - (Date.now() - start), TOOL_TIMEOUT - totalElapsed());
+      if (remainingBeforeSleep <= 0) break;
+      await new Promise(r => setTimeout(r, Math.min(POLL_INTERVAL, remainingBeforeSleep)));
 
       let msgs;
       try {
-        msgs = await this._api("GET", `/session/${sid}/message`);
+        const remainingForPoll = Math.min(maxWaitMs - (Date.now() - start), TOOL_TIMEOUT - totalElapsed());
+        if (remainingForPoll <= 0) break;
+        msgs = await this._api("GET", `/session/${sid}/message`, undefined, undefined, Math.min(API_TIMEOUT, remainingForPoll));
       } catch (e) {
         log(`Poll error: ${e.message}`);
         continue; // transient, retry
@@ -674,7 +746,8 @@ class OpencodeHub {
           const detail = err.data?.message || err.name || JSON.stringify(err);
           log(`Assistant error: ${detail}`);
           try { await this._api("DELETE", `/session/${sid}`); } catch {}
-          return `Error from model: ${detail}`;
+          this._jobs.delete(job.id);
+          return { status: "timeout", elapsed: totalElapsed(), last, text: `Error from model: ${detail}` };
         }
       }
 
@@ -689,27 +762,103 @@ class OpencodeHub {
       }
 
       // New messages arrived → reset stability
-      if (msgs.length > prev) { prev = msgs.length; stable = 0; last = resp; lastMsgs = msgs; continue; }
+      if (msgs.length > prev) {
+        prev = msgs.length;
+        stable = 0;
+        last = resp;
+        job.last = last;
+        job.lastMessageCount = prev;
+        continue;
+      }
 
       // Same message count, content stabilized
       if (resp && resp === last) {
         stable++;
         if (stable >= 3) {
           log(`Session ${sid} stabilized after ${Date.now() - start}ms`);
+          job.last = last;
+          job.lastMessageCount = msgs.length;
           break;
         }
       } else if (resp) {
         last = resp;
         stable = 0;
-        lastMsgs = msgs;
+        job.last = last;
+        job.lastMessageCount = msgs.length;
       }
     }
 
-    try { await this._api("DELETE", `/session/${sid}`); } catch {}
-    const elapsed = Date.now() - start;
-    if (!last) return `(no response after ${(elapsed / 1000).toFixed(0)}s)`;
-    log(`Session ${sid} complete: ${last.length} chars in ${elapsed}ms`);
-    return last;
+    const elapsed = totalElapsed();
+    if (last && stable >= 3) {
+      if (deleteOnComplete) {
+        try { await this._api("DELETE", `/session/${sid}`); } catch {}
+        this._jobs.delete(job.id);
+      }
+      log(`Session ${sid} complete: ${last.length} chars in ${elapsed}ms`);
+      return { status: "complete", elapsed, last, text: last };
+    }
+
+    if (elapsed >= TOOL_TIMEOUT) {
+      try { await this._api("DELETE", `/session/${sid}`); } catch {}
+      this._jobs.delete(job.id);
+      const text = last || `(no response after ${(elapsed / 1000).toFixed(0)}s)`;
+      return { status: "timeout", elapsed, last, text: `Opencode job timed out after ${(elapsed / 1000).toFixed(0)}s.\n\n${text}` };
+    }
+
+    job.last = last;
+    job.lastMessageCount = prev;
+    return { status: "running", elapsed, last, reason: "return_timeout" };
+  }
+
+  _formatRunningJob(job, result = {}) {
+    const lines = [
+      "Opencode job is still running.",
+      `job_id: ${job.id}`,
+      `status: running`,
+      `elapsed_ms: ${Math.max(0, Math.round(result.elapsed || 0))}`,
+      "",
+      "Poll with:",
+      JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: 30000 } }),
+    ];
+    if (result.last) {
+      lines.push("", "Latest partial output:", result.last.slice(0, 4000));
+    }
+    return lines.join("\n");
+  }
+
+  _formatJobList() {
+    const jobs = [...this._jobs.values()].map((job) => ({
+      job_id: job.id,
+      agent: job.agent,
+      model: job.model,
+      age_ms: Date.now() - job.createdAt,
+      has_partial: !!job.last,
+    }));
+    return JSON.stringify({ jobs }, null, 2);
+  }
+
+  async _jobToolCall(action, jobId, waitMs) {
+    if (action === "list") return this._formatJobList();
+    if (!jobId) return "Provide job_id for status or cancel.";
+    const job = this._jobs.get(jobId);
+    if (!job) return `Job not found or already completed: ${jobId}`;
+
+    if (action === "cancel") {
+      try { await this._api("DELETE", `/session/${job.sid}`); } catch {}
+      this._jobs.delete(job.id);
+      return `Cancelled opencode job: ${job.id}`;
+    }
+
+    if (action !== "status") return `Unknown job action: ${action}`;
+
+    const result = await this._pollSession(job, {
+      maxWaitMs: this._clampedWaitMs(waitMs ?? 30_000),
+      deleteOnComplete: true,
+    });
+
+    if (result.status === "complete" || result.status === "timeout") return result.text;
+    this._jobs.set(job.id, job);
+    return this._formatRunningJob(job, result);
   }
 
   // ── Backend: proxied MCPs ────────────────────────────────────────
@@ -817,13 +966,33 @@ class OpencodeHub {
           list: { type: "string", description: "Set to \"agents\" or \"models\"", enum: ["agents", "models"] },
           context: { type: "string", description: "Use no project context or the current working directory.", enum: ["none", "cwd"], default: "cwd" },
           directory: { type: "string", description: "Working directory" },
+          background: { type: "boolean", description: "Start the opencode session and return a job_id immediately instead of waiting for completion." },
+          wait_ms: { type: "integer", description: "Maximum synchronous wait before returning a pollable job. Clamped by OPENCODE_MCP_RETURN_TIMEOUT_MS." },
+        },
+      },
+    };
+  }
+
+  get _jobTool() {
+    return {
+      name: "opencode_job",
+      description:
+        "Poll, list, or cancel long-running opencode jobs returned by opencode/opencode_model_* tools.\n\n" +
+        "Use this when a prior call returned a job_id because the model was still running.",
+      inputSchema: {
+        type: "object",
+        required: ["action"],
+        properties: {
+          action: { type: "string", enum: ["status", "cancel", "list"], description: "Job operation to perform." },
+          job_id: { type: "string", description: "Job id returned by an earlier opencode call. Required for status/cancel." },
+          wait_ms: { type: "integer", description: "Optional short wait while polling status. Clamped by OPENCODE_MCP_RETURN_TIMEOUT_MS." },
         },
       },
     };
   }
 
   get _allTools() {
-    return [this._opencodeTool, ...this._modelAliasTools, ...this._proxiedTools];
+    return [this._opencodeTool, this._jobTool, ...this._modelAliasTools, ...this._proxiedTools];
   }
 
   // ── JSON-RPC handlers ─────────────────────────────────────────────
@@ -870,7 +1039,7 @@ class OpencodeHub {
     try {
       // ── opencode tool ───────────────────────────────────────────
       if (toolName === "opencode") {
-        const { model, prompt, list, directory, context } = args;
+        const { model, prompt, list, directory, context, background, wait_ms } = args;
         const requestedAgent = args.agent || args.mode;
 
         if (list === "agents") {
@@ -891,15 +1060,22 @@ class OpencodeHub {
             return this.toolError(id, `Agent/mode "${requestedAgent}" not found. Available: ${AGENTS.map(a => a.name).join(", ") || "(opencode will decide if config is unavailable)"}`);
           }
           log(`Run agent: ${resolvedAgent.name}`);
-          const result = await this._opencodeCall(resolvedAgent.name, null, prompt, directory, context || "cwd");
+          const result = await this._opencodeCall(resolvedAgent.name, null, prompt, directory, context || "cwd", { background, waitMs: wait_ms });
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
         if (model) {
           log(`Chat model: ${model}`);
-          const result = await this._opencodeCall(null, model, prompt, directory, context || "cwd");
+          const result = await this._opencodeCall(null, model, prompt, directory, context || "cwd", { background, waitMs: wait_ms });
           return this.r(id, { content: [{ type: "text", text: result }] });
         }
         return this.toolError(id, "Provide agent+prompt, mode+prompt, model+prompt, or list.");
+      }
+
+      // ── Long-running opencode jobs ──────────────────────────────
+      if (toolName === "opencode_job") {
+        const { action, job_id, wait_ms } = args;
+        const result = await this._jobToolCall(action, job_id, wait_ms);
+        return this.r(id, { content: [{ type: "text", text: result }] });
       }
 
       // ── Dynamic opencode model alias tools ───────────────────────
@@ -908,11 +1084,11 @@ class OpencodeHub {
       }
       const modelBackend = this._modelToolBackend[toolName];
       if (modelBackend) {
-        const { prompt, model, directory, context } = args;
+        const { prompt, model, directory, context, background, wait_ms } = args;
         if (!prompt) return this.toolError(id, "Provide prompt.");
         const resolvedModel = this._resolveProviderModel(modelBackend, model);
         log(`Alias tool "${toolName}" resolved to model: ${resolvedModel}`);
-        const result = await this._opencodeCall(null, resolvedModel, prompt, directory, context || "none");
+        const result = await this._opencodeCall(null, resolvedModel, prompt, directory, context || "none", { background, waitMs: wait_ms });
         return this.r(id, { content: [{ type: "text", text: result }] });
       }
 
@@ -946,6 +1122,7 @@ class OpencodeHub {
     this._toolBackend = {};
     this._modelAliasTools = [];
     this._modelToolBackend = {};
+    this._jobs.clear();
     this._mcpsStarted = null;
     if (this._emptyContextDir) {
       try { rmSync(this._emptyContextDir, { recursive: true, force: true }); } catch {}

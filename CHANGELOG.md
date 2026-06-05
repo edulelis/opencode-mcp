@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.0 (2026-06-05)
+
+- **Async opencode jobs**: Long-running agent/model calls now return a pollable `job_id` before MCP clients can hit their own `tools/call` timeout. Use `opencode_job` to poll, list, or cancel jobs.
+- **Background mode**: `opencode` and dynamic `opencode_model_*` tools now accept `background: true` and `wait_ms` for explicit lifecycle control.
+- **HTTP API timeout**: Added `OPENCODE_API_TIMEOUT_MS` so one stalled opencode HTTP request cannot hang the bridge indefinitely.
+- **Tests**: Added a fake slow-model regression test proving slow calls return a job and can later be polled to completion.
+
 ## 5.3.0 (2026-06-03)
 
 - **Dynamic provider/family tools**: `tools/list` now generates `opencode_model_<provider-or-family>` shortcuts from the live `opencode models` output, so MCP clients can discover DeepSeek, Gemini, Claude, MiniMax, OpenAI/GPT, and future providers without hardcoded tool names.
