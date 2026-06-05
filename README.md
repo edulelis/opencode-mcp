@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.5/opencode-mcp-v5.4.5.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.6/opencode-mcp-v5.4.6.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.5/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.6/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -235,7 +235,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_TOOL_TIMEOUT_MS` | `600000` | Max wait for opencode agent/model calls |
 | `OPENCODE_MCP_RETURN_TIMEOUT_MS` | `60000` | Max synchronous wait before returning a pollable `opencode_job` |
 | `OPENCODE_API_TIMEOUT_MS` | `10000` | Max wait for one regular opencode HTTP API request |
-| `OPENCODE_MESSAGE_TIMEOUT_MS` | `120000` | Max wait for initial opencode message submission |
+| `OPENCODE_MESSAGE_TIMEOUT_MS` | `120000` | Max wait for initial async opencode message submission |
 | `OPENCODE_COMPLETED_JOB_TTL_MS` | `600000` | How long completed job output remains available for repeat `opencode_job status` polls |
 | `OPENCODE_STABLE_COMPLETION_MS` | `30000` | Legacy fallback delay before treating stable output as complete when opencode does not expose completion metadata |
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |

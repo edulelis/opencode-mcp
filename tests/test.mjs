@@ -110,13 +110,13 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { id });
   }
 
-  const match = url.pathname.match(/^\\/session\\/([^/]+)(?:\\/message)?$/);
+  const match = url.pathname.match(/^\\/session\\/([^/]+)(?:\\/(message|prompt_async))?$/);
   if (!match) return send(res, 404, { error: "not found" });
   const sid = match[1];
   const session = sessions.get(sid);
   if (!session) return send(res, 404, { error: "missing session" });
 
-  if (req.method === "POST" && url.pathname.endsWith("/message")) {
+  if (req.method === "POST" && (url.pathname.endsWith("/message") || url.pathname.endsWith("/prompt_async"))) {
     const body = await readBody(req);
     const prompt = body.parts?.[0]?.text || "";
     if (body.agent) {
@@ -135,7 +135,14 @@ const server = http.createServer(async (req, res) => {
       session.readyAt = Date.now();
       session.finalAt = Date.now() + 280;
     }
-    if (submitDelay) {
+    if (prompt.includes("tool-step-final")) {
+      session.response = "Let me inspect the requested files.";
+      session.finalResponse = "FINAL_TOOL_STEP: scenario runner is pnpm run test:scenario";
+      session.readyAt = Date.now();
+      session.finalAt = Date.now() + 280;
+      session.toolStepFinal = true;
+    }
+    if (submitDelay && url.pathname.endsWith("/message")) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
     }
@@ -144,6 +151,34 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname.endsWith("/message")) {
     const now = Date.now();
+    if (session.toolStepFinal) {
+      const finalComplete = now >= session.finalAt;
+      const firstAssistantInfo = { role: "assistant", time: { created: session.createdAt + 1, completed: session.createdAt + 2 } };
+      const secondAssistantInfo = { role: "assistant", time: { created: session.createdAt + 3 } };
+      const secondAssistantParts = finalComplete
+        ? [
+            { type: "step-start" },
+            { type: "text", text: session.finalResponse },
+            { type: "step-finish" }
+          ]
+        : [];
+      if (finalComplete) secondAssistantInfo.time.completed = now;
+      return send(res, 200, [
+        { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
+        {
+          info: firstAssistantInfo,
+          parts: [
+            { type: "step-start" },
+            { type: "text", text: session.response || "" },
+            { type: "tool", id: "read-1" },
+            { type: "tool", id: "read-2" },
+            { type: "step-finish" }
+          ]
+        },
+        { info: secondAssistantInfo, parts: secondAssistantParts }
+      ]);
+    }
+
     let assistantText = "";
     let completed = false;
     if (session.finalResponse) {
@@ -556,7 +591,7 @@ async function run() {
   }
 
   {
-    console.log("\n[10] returns a pollable job while initial message submit is still pending");
+    console.log("\n[10] returns a pollable job while async message execution continues");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
@@ -564,8 +599,7 @@ async function run() {
         const started = await srv.waitForResponse(2);
         const startedText = started?.result?.content?.[0]?.text || "";
         const jobId = startedText.match(/job_id: (\S+)/)?.[1];
-        assert(startedText.includes("Opencode job is still running."), "slow submit returns running job instead of API timeout");
-        assert(startedText.includes("submit_status: pending"), "running job reports pending message submit");
+        assert(startedText.includes("Opencode job is still running."), "slow async message returns running job instead of API timeout");
         assert(!!jobId, "slow submit response includes job_id");
 
         await new Promise(r => setTimeout(r, 240));
@@ -618,7 +652,36 @@ async function run() {
   }
 
   {
-    console.log("\n[12] shutdown");
+    console.log("\n[12] ignores completed interim tool-step assistant turns");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "tool-step-final please", wait_ms: 60 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "tool-step call returns a running job");
+        assert(!!jobId, "tool-step response includes job_id");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 120 } } });
+        const interim = await srv.waitForResponse(3);
+        const interimText = interim?.result?.content?.[0]?.text || "";
+        assert(interimText.includes("Opencode job is still running."), "completed interim tool step remains pollable");
+        assert(!interimText.includes("Let me inspect the requested files."), "completed interim tool step is not returned as final output");
+
+        await new Promise(r => setTimeout(r, 260));
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(4);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("FINAL_TOOL_STEP: scenario runner is pnpm run test:scenario"), "final assistant turn is returned after tool-step sequence");
+      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[13] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

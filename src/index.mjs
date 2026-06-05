@@ -18,7 +18,7 @@
  *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
  *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 60000)
  *   OPENCODE_API_TIMEOUT_MS   max wait for one regular opencode HTTP call (default: 10000)
- *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial message submission (default: 120000)
+ *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial async message submission (default: 120000)
  *   OPENCODE_COMPLETED_JOB_TTL_MS keep completed job output available for repeat polls (default: 600000)
  *   OPENCODE_STABLE_COMPLETION_MS legacy no-completion-signal fallback delay (default: 30000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.5";
+const VERSION = "5.4.6";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -653,13 +653,29 @@ class OpencodeHub {
     job.submitDone = false;
     job.submitError = null;
     job.submitStartedAt = Date.now();
-    job.submitPromise = this._api(
-      "POST",
-      `/session/${job.sid}/message`,
-      msgBody,
-      { directory: job.directory },
-      MESSAGE_TIMEOUT,
-    )
+    const submitAsync = () =>
+      this._api(
+        "POST",
+        `/session/${job.sid}/prompt_async`,
+        msgBody,
+        { directory: job.directory },
+        MESSAGE_TIMEOUT,
+      );
+    const submitStreamingFallback = () =>
+      this._api(
+        "POST",
+        `/session/${job.sid}/message`,
+        msgBody,
+        { directory: job.directory },
+        MESSAGE_TIMEOUT,
+      );
+    job.submitPromise = submitAsync()
+      .catch((error) => {
+        if (String(error?.message || "").match(/API (404|405):/)) {
+          return submitStreamingFallback();
+        }
+        throw error;
+      })
       .then((result) => {
         job.submitDone = true;
         job.submitResult = result;
@@ -696,6 +712,34 @@ class OpencodeHub {
         .join("\n");
     }
     return typeof message?.content === "string" ? message.content : "";
+  }
+
+  _latestAssistantState(messages, prompt) {
+    let latestAssistant = null;
+    let latestAssistantIndex = -1;
+    for (const [index, message] of messages.entries()) {
+      if (this._isAssistantMessage(message)) {
+        latestAssistant = message;
+        latestAssistantIndex = index;
+      }
+    }
+
+    if (!latestAssistant) {
+      return {
+        index: -1,
+        text: "",
+        complete: false,
+        hasLatestAssistant: false,
+      };
+    }
+
+    const text = this._extractMessageText(latestAssistant);
+    return {
+      index: latestAssistantIndex,
+      text: text && text !== prompt ? text : "",
+      complete: this._isAssistantMessageComplete(latestAssistant),
+      hasLatestAssistant: true,
+    };
   }
 
   _pruneCompletedJobs() {
@@ -846,16 +890,15 @@ class OpencodeHub {
         }
       }
 
-      let resp = "";
-      let assistantComplete = false;
-      for (const m of msgs) {
-        const t = this._extractMessageText(m);
-        if (!t || t === prompt) continue;
-        if (this._isAssistantMessage(m)) {
-          resp = t;
-          assistantComplete = this._isAssistantMessageComplete(m);
-        } else if (!resp) {
-          resp = t;
+      const latestAssistant = this._latestAssistantState(msgs, prompt);
+      let resp = latestAssistant.text;
+      let assistantComplete = latestAssistant.complete && !!latestAssistant.text;
+      if (!resp && !latestAssistant.hasLatestAssistant) {
+        for (const m of msgs) {
+          const t = this._extractMessageText(m);
+          if (t && t !== prompt) {
+            resp = t;
+          }
         }
       }
 

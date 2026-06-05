@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.4.6 (2026-06-05)
+
+- **Async submit endpoint**: Initial message submission now uses opencode's `/prompt_async` endpoint, falling back to `/message` only for older servers. This avoids long repo-aware prompts spending minutes inside the submit request.
+- **Final-turn detection fix**: Job polling now completes only when the latest assistant message has completed final text, so completed interim tool-step messages are not mistaken for the final answer.
+- **Tests**: Added a regression matching real repo-aware opencode output: a completed assistant step with `tool` parts followed by a later empty/final assistant message.
+
 ## 5.4.5 (2026-06-05)
 
 - **Completion detection fix**: Job polling now waits for opencode's assistant completion metadata instead of treating briefly stable partial output as final.
