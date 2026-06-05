@@ -15,6 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/s
 ```
 
 This downloads the [latest release](https://github.com/edulelis/opencode-mcp/releases/latest), extracts it to `~/.opencode-mcp`, and prints registration instructions.
+Run the same command again to update an existing install. The installer checks the current version, skips cleanly when already current, and uses a timestamped backup before replacing files. Use `--force` or `OPENCODE_MCP_FORCE=1` to reinstall the same version.
 
 ### Manual (just the server file)
 
@@ -22,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.1/opencode-mcp-v5.4.1.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.2/opencode-mcp-v5.4.2.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -30,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.1/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.2/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 

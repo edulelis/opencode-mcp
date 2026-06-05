@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.2 (2026-06-05)
+
+- **Install/update script**: `scripts/setup.sh` now handles first install, update, no-op when already current, and forced reinstall through the same path.
+- **Safer updates**: Existing installs are replaced cleanly after a timestamped backup, avoiding stale files from older releases.
+- **Local compatibility**: Node.js < 24 is now a warning during install/update instead of blocking downloads, while still warning that Node.js >= 24 is required to run the MCP server.
+- **Copied bridge sync**: Added `OPENCODE_MCP_CODEX_BRIDGE_PATH` for setups that need to sync a copied bridge file after install/update.
+
 ## 5.4.1 (2026-06-05)
 
 - **Release metadata fix**: Corrected the MCP server `serverInfo.version` and startup banner to match the package/release version.
