@@ -1,5 +1,9 @@
 # Changelog
 
+## 5.4.3 (2026-06-05)
+
+- **Installer idempotency**: Re-running `scripts/setup.sh` with `OPENCODE_MCP_CODEX_BRIDGE_PATH` now syncs the copied bridge even when the requested version is already installed.
+
 ## 5.4.2 (2026-06-05)
 
 - **Install/update script**: `scripts/setup.sh` now handles first install, update, no-op when already current, and forced reinstall through the same path.

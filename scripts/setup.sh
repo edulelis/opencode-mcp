@@ -83,6 +83,23 @@ print_next_steps() {
   echo "    Restart or reload your MCP client so it sees new tools and schemas."
 }
 
+sync_copied_bridge() {
+  if [ -z "${OPENCODE_MCP_CODEX_BRIDGE_PATH:-}" ]; then
+    return
+  fi
+
+  if [ ! -f "$INSTALL_DIR/src/index.mjs" ]; then
+    err "Cannot sync copied bridge because $INSTALL_DIR/src/index.mjs was not found"
+    exit 1
+  fi
+
+  info "Syncing copied bridge to $OPENCODE_MCP_CODEX_BRIDGE_PATH"
+  mkdir -p "$(dirname "$OPENCODE_MCP_CODEX_BRIDGE_PATH")"
+  cp "$INSTALL_DIR/src/index.mjs" "$OPENCODE_MCP_CODEX_BRIDGE_PATH"
+  chmod +x "$OPENCODE_MCP_CODEX_BRIDGE_PATH" 2>/dev/null || true
+  ok "Copied bridge synced"
+}
+
 # ── Banner ──────────────────────────────────────────────────────────────────
 cat <<'BANNER'
   ┌──────────────────────────────────────┐
@@ -179,6 +196,7 @@ fi
 if [ "$IS_RELEASE" = true ] && [ "$FORCE" != "1" ] && [ -n "$CURRENT_VERSION" ] \
   && [ "$(normalize_version "$CURRENT_VERSION")" = "$(normalize_version "$VERSION")" ]; then
   ok "opencode-mcp $VERSION is already installed"
+  sync_copied_bridge
   print_next_steps "No update needed. Use --force or OPENCODE_MCP_FORCE=1 to reinstall."
   exit 0
 fi
@@ -273,13 +291,7 @@ else
   warn "Skipped server syntax check because Node.js >= 24 is not active"
 fi
 
-if [ -n "${OPENCODE_MCP_CODEX_BRIDGE_PATH:-}" ]; then
-  info "Syncing copied bridge to $OPENCODE_MCP_CODEX_BRIDGE_PATH"
-  mkdir -p "$(dirname "$OPENCODE_MCP_CODEX_BRIDGE_PATH")"
-  cp "$INSTALL_DIR/src/index.mjs" "$OPENCODE_MCP_CODEX_BRIDGE_PATH"
-  chmod +x "$OPENCODE_MCP_CODEX_BRIDGE_PATH" 2>/dev/null || true
-  ok "Copied bridge synced"
-fi
+sync_copied_bridge
 
 # ── Next steps ──────────────────────────────────────────────────────────────
 print_next_steps "Installation complete!"
