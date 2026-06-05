@@ -13,7 +13,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -295,6 +295,14 @@ async function withServer(fix, fn, extraEnv) {
 
 async function run() {
   console.log("\nopencode-mcp test suite\n");
+
+  {
+    console.log("[0] package and runtime versions match");
+    const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
+    const source = readFileSync(SERVER, "utf-8");
+    const runtimeVersion = source.match(/const VERSION = "([^"]+)"/)?.[1];
+    assert(runtimeVersion === pkg.version, "runtime VERSION matches package.json version");
+  }
 
   {
     console.log("[1] initializes without an opencode binary");

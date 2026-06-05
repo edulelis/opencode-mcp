@@ -1,5 +1,10 @@
 # Changelog
 
+## 5.4.1 (2026-06-05)
+
+- **Release metadata fix**: Corrected the MCP server `serverInfo.version` and startup banner to match the package/release version.
+- **Tests**: Added a guard that fails when the package version and runtime `VERSION` constant drift.
+
 ## 5.4.0 (2026-06-05)
 
 - **Async opencode jobs**: Long-running agent/model calls now return a pollable `job_id` before MCP clients can hit their own `tools/call` timeout. Use `opencode_job` to poll, list, or cancel jobs.
