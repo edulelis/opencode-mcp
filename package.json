@@ -1,6 +1,6 @@
 {
   "name": "opencode-mcp",
-  "version": "5.4.4",
+  "version": "5.4.5",
   "description": "MCP server that bridges Codex app ↔ opencode agents. Use opencode's models, agents, and credentials from any MCP-compatible client.",
   "type": "module",
   "main": "src/index.mjs",

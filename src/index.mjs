@@ -19,6 +19,8 @@
  *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 60000)
  *   OPENCODE_API_TIMEOUT_MS   max wait for one regular opencode HTTP call (default: 10000)
  *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial message submission (default: 120000)
+ *   OPENCODE_COMPLETED_JOB_TTL_MS keep completed job output available for repeat polls (default: 600000)
+ *   OPENCODE_STABLE_COMPLETION_MS legacy no-completion-signal fallback delay (default: 30000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -35,7 +37,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.4";
+const VERSION = "5.4.5";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -87,6 +89,8 @@ const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
 const RETURN_TIMEOUT = parseInt(process.env.OPENCODE_MCP_RETURN_TIMEOUT_MS) || 60_000;
 const API_TIMEOUT = parseInt(process.env.OPENCODE_API_TIMEOUT_MS) || 10_000;
 const MESSAGE_TIMEOUT = parseInt(process.env.OPENCODE_MESSAGE_TIMEOUT_MS) || Math.max(API_TIMEOUT, 120_000);
+const COMPLETED_JOB_TTL = parseInt(process.env.OPENCODE_COMPLETED_JOB_TTL_MS) || 600_000;
+const STABLE_COMPLETION_MS = parseInt(process.env.OPENCODE_STABLE_COMPLETION_MS) || 30_000;
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
@@ -281,6 +285,7 @@ class OpencodeHub {
     this._modelToolCacheKey = "";
     this._emptyContextDir = null;
     this._jobs = new Map();
+    this._completedJobs = new Map();
 
     // Proxied MCP backends
     this._mcpClients = []; // MCPClient[]
@@ -668,6 +673,54 @@ class OpencodeHub {
       });
   }
 
+  _messageInfo(message) {
+    return message?.info && typeof message.info === "object" ? message.info : message;
+  }
+
+  _isAssistantMessage(message) {
+    return this._messageInfo(message)?.role === "assistant";
+  }
+
+  _isAssistantMessageComplete(message) {
+    const completed = this._messageInfo(message)?.time?.completed;
+    return typeof completed === "number" && Number.isFinite(completed);
+  }
+
+  _extractMessageText(message) {
+    const parts = message?.parts;
+    if (Array.isArray(parts)) {
+      return parts
+        .filter((part) => (part.type === "text" || (INCLUDE_REASONING && part.type === "reasoning")) && part.text)
+        .map((part) => part.text.trim())
+        .filter(Boolean)
+        .join("\n");
+    }
+    return typeof message?.content === "string" ? message.content : "";
+  }
+
+  _pruneCompletedJobs() {
+    const now = Date.now();
+    for (const [jobId, completed] of this._completedJobs.entries()) {
+      if (now - completed.completedAt > COMPLETED_JOB_TTL) {
+        this._completedJobs.delete(jobId);
+      }
+    }
+  }
+
+  _completeActiveJob(job, result) {
+    const wasTracked = this._jobs.has(job.id);
+    this._jobs.delete(job.id);
+    if (wasTracked && result?.text) {
+      this._completedJobs.set(job.id, {
+        job_id: job.id,
+        status: result.status || "complete",
+        completedAt: Date.now(),
+        text: result.text,
+      });
+      this._pruneCompletedJobs();
+    }
+  }
+
   async _createOpencodeJob(agent, model, prompt, directory, context = "cwd") {
     await this._ensureOpencode();
     const dir = this._resolveDirectory(directory, context, "cwd");
@@ -733,6 +786,7 @@ class OpencodeHub {
     let prev = job.lastMessageCount || 0;
     let stable = 0;
     let last = job.last || "";
+    let completionSignalSeen = false;
     log(`Polling session ${sid} (max sync ${maxWaitMs}ms, max total ${TOOL_TIMEOUT}ms)...`);
 
     if (maxWaitMs <= 0) {
@@ -742,13 +796,14 @@ class OpencodeHub {
     while (Date.now() - start < maxWaitMs && totalElapsed() < TOOL_TIMEOUT) {
       if (job.submitError && !last) {
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
-        this._jobs.delete(job.id);
-        return {
+        const result = {
           status: "timeout",
           elapsed: totalElapsed(),
           last,
           text: `Error submitting opencode message: ${job.submitError.message}`,
         };
+        this._completeActiveJob(job, result);
+        return result;
       }
 
       // Detect if opencode server process died
@@ -756,8 +811,9 @@ class OpencodeHub {
         const msg = `Opencode server exited with code ${this._openServerExitCode}`;
         log(msg);
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
-        this._jobs.delete(job.id);
-        return { status: "timeout", elapsed: totalElapsed(), last, text: `Error: ${msg}` };
+        const result = { status: "timeout", elapsed: totalElapsed(), last, text: `Error: ${msg}` };
+        this._completeActiveJob(job, result);
+        return result;
       }
 
       const remainingBeforeSleep = Math.min(maxWaitMs - (Date.now() - start), TOOL_TIMEOUT - totalElapsed());
@@ -784,35 +840,51 @@ class OpencodeHub {
           const detail = err.data?.message || err.name || JSON.stringify(err);
           log(`Assistant error: ${detail}`);
           try { await this._api("DELETE", `/session/${sid}`); } catch {}
-          this._jobs.delete(job.id);
-          return { status: "timeout", elapsed: totalElapsed(), last, text: `Error from model: ${detail}` };
+          const result = { status: "timeout", elapsed: totalElapsed(), last, text: `Error from model: ${detail}` };
+          this._completeActiveJob(job, result);
+          return result;
         }
       }
 
       let resp = "";
+      let assistantComplete = false;
       for (const m of msgs) {
-        const parts = m.parts;
-        const t = parts
-          ? parts.filter(p => (p.type === "text" || (INCLUDE_REASONING && p.type === "reasoning")) && p.text)
-                 .map(p => p.text.trim()).filter(Boolean).join("\n")
-          : (m.content || "");
-        if (t && t !== prompt) resp = t;
+        const t = this._extractMessageText(m);
+        if (!t || t === prompt) continue;
+        if (this._isAssistantMessage(m)) {
+          resp = t;
+          assistantComplete = this._isAssistantMessageComplete(m);
+        } else if (!resp) {
+          resp = t;
+        }
+      }
+
+      if (resp && resp !== last) {
+        last = resp;
+        stable = 0;
+        job.last = last;
+      }
+
+      if (resp && assistantComplete) {
+        completionSignalSeen = true;
+        job.last = last;
+        job.lastMessageCount = msgs.length;
+        break;
       }
 
       // New messages arrived → reset stability
       if (msgs.length > prev) {
         prev = msgs.length;
         stable = 0;
-        last = resp;
-        job.last = last;
         job.lastMessageCount = prev;
         continue;
       }
 
-      // Same message count, content stabilized
+      // Same message count, content stabilized. This is only a legacy fallback
+      // for opencode builds that do not expose assistant.time.completed.
       if (resp && resp === last) {
         stable++;
-        if (stable >= 3) {
+        if (stable >= 3 && totalElapsed() >= STABLE_COMPLETION_MS) {
           log(`Session ${sid} stabilized after ${Date.now() - start}ms`);
           job.last = last;
           job.lastMessageCount = msgs.length;
@@ -827,10 +899,10 @@ class OpencodeHub {
     }
 
     const elapsed = totalElapsed();
-    if (last && stable >= 3) {
+    if (last && (completionSignalSeen || (stable >= 3 && elapsed >= STABLE_COMPLETION_MS))) {
       if (deleteOnComplete) {
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
-        this._jobs.delete(job.id);
+        this._completeActiveJob(job, { status: "complete", text: last });
       }
       log(`Session ${sid} complete: ${last.length} chars in ${elapsed}ms`);
       return { status: "complete", elapsed, last, text: last };
@@ -838,9 +910,10 @@ class OpencodeHub {
 
     if (elapsed >= TOOL_TIMEOUT) {
       try { await this._api("DELETE", `/session/${sid}`); } catch {}
-      this._jobs.delete(job.id);
       const text = last || `(no response after ${(elapsed / 1000).toFixed(0)}s)`;
-      return { status: "timeout", elapsed, last, text: `Opencode job timed out after ${(elapsed / 1000).toFixed(0)}s.\n\n${text}` };
+      const result = { status: "timeout", elapsed, last, text: `Opencode job timed out after ${(elapsed / 1000).toFixed(0)}s.\n\n${text}` };
+      this._completeActiveJob(job, result);
+      return result;
     }
 
     job.last = last;
@@ -868,6 +941,7 @@ class OpencodeHub {
   }
 
   _formatJobList() {
+    this._pruneCompletedJobs();
     const jobs = [...this._jobs.values()].map((job) => ({
       job_id: job.id,
       agent: job.agent,
@@ -876,14 +950,24 @@ class OpencodeHub {
       has_partial: !!job.last,
       submit_pending: !job.submitDone,
     }));
-    return JSON.stringify({ jobs }, null, 2);
+    const completed_jobs = [...this._completedJobs.values()].map((job) => ({
+      job_id: job.job_id,
+      status: job.status,
+      age_ms: Date.now() - job.completedAt,
+    }));
+    return JSON.stringify({ jobs, completed_jobs }, null, 2);
   }
 
   async _jobToolCall(action, jobId, waitMs) {
     if (action === "list") return this._formatJobList();
     if (!jobId) return "Provide job_id for status or cancel.";
+    this._pruneCompletedJobs();
     const job = this._jobs.get(jobId);
-    if (!job) return `Job not found or already completed: ${jobId}`;
+    if (!job) {
+      const completed = this._completedJobs.get(jobId);
+      if (completed) return completed.text;
+      return `Job not found or already completed: ${jobId}`;
+    }
 
     if (action === "cancel") {
       try { await this._api("DELETE", `/session/${job.sid}`); } catch {}
@@ -1165,6 +1249,7 @@ class OpencodeHub {
     this._modelAliasTools = [];
     this._modelToolBackend = {};
     this._jobs.clear();
+    this._completedJobs.clear();
     this._mcpsStarted = null;
     if (this._emptyContextDir) {
       try { rmSync(this._emptyContextDir, { recursive: true, force: true }); } catch {}

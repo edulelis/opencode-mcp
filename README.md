@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.4/opencode-mcp-v5.4.4.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.5/opencode-mcp-v5.4.5.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.4/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.5/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -184,7 +184,7 @@ You can also start a call in the background immediately:
 }
 ```
 
-Use `{"action":"list"}` to list running jobs and `{"action":"cancel","job_id":"s1"}` to cancel one.
+Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion.
 
 ### 5. List resources
 
@@ -236,6 +236,8 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_MCP_RETURN_TIMEOUT_MS` | `60000` | Max synchronous wait before returning a pollable `opencode_job` |
 | `OPENCODE_API_TIMEOUT_MS` | `10000` | Max wait for one regular opencode HTTP API request |
 | `OPENCODE_MESSAGE_TIMEOUT_MS` | `120000` | Max wait for initial opencode message submission |
+| `OPENCODE_COMPLETED_JOB_TTL_MS` | `600000` | How long completed job output remains available for repeat `opencode_job status` polls |
+| `OPENCODE_STABLE_COMPLETION_MS` | `30000` | Legacy fallback delay before treating stable output as complete when opencode does not expose completion metadata |
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |

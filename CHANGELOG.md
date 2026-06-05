@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.5 (2026-06-05)
+
+- **Completion detection fix**: Job polling now waits for opencode's assistant completion metadata instead of treating briefly stable partial output as final.
+- **Completed result cache**: Completed or timed-out tracked jobs keep their output available for repeat `opencode_job status` polls for `OPENCODE_COMPLETED_JOB_TTL_MS` (default `600000`).
+- **Legacy fallback guard**: Added `OPENCODE_STABLE_COMPLETION_MS` (default `30000`) before using stable output as a completion fallback for opencode builds without completion metadata.
+- **Tests**: Added a partial-then-final regression proving stable partial output remains pollable and final output can be fetched repeatedly.
+
 ## 5.4.4 (2026-06-05)
 
 - **Long prompt submission fix**: Initial `POST /session/:id/message` submission now runs asynchronously after session creation, so slow repo-aware prompts can return a pollable job instead of failing before a job exists.

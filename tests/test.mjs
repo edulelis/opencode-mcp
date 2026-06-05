@@ -106,7 +106,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/session") {
     const id = "s" + nextSession++;
-    sessions.set(id, { response: "", directory: url.searchParams.get("directory") || "", readyAt: 0 });
+    sessions.set(id, { response: "", directory: url.searchParams.get("directory") || "", readyAt: 0, createdAt: Date.now() });
     return send(res, 200, { id });
   }
 
@@ -129,6 +129,12 @@ const server = http.createServer(async (req, res) => {
     session.prompt = prompt;
     const submitDelay = prompt.includes("slow-submit") ? 180 : 0;
     session.readyAt = prompt.includes("slow-response") || submitDelay ? Date.now() + 180 : Date.now();
+    if (prompt.includes("partial-then-final")) {
+      session.response = "PARTIAL: still investigating";
+      session.finalResponse = "FINAL: model=deepseek/deepseek-chat complete";
+      session.readyAt = Date.now();
+      session.finalAt = Date.now() + 280;
+    }
     if (submitDelay) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
@@ -137,12 +143,28 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname.endsWith("/message")) {
-    const assistantParts = Date.now() >= session.readyAt
-      ? [{ type: "text", text: session.response || "" }]
+    const now = Date.now();
+    let assistantText = "";
+    let completed = false;
+    if (session.finalResponse) {
+      if (now >= session.finalAt) {
+        assistantText = session.finalResponse;
+        completed = true;
+      } else if (now >= session.readyAt) {
+        assistantText = session.response || "";
+      }
+    } else if (now >= session.readyAt) {
+      assistantText = session.response || "";
+      completed = true;
+    }
+    const assistantInfo = { role: "assistant", time: { created: session.createdAt } };
+    if (completed) assistantInfo.time.completed = now;
+    const assistantParts = assistantText
+      ? [{ type: "text", text: assistantText }]
       : [];
     return send(res, 200, [
       { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
-      { info: { role: "assistant" }, parts: assistantParts }
+      { info: assistantInfo, parts: assistantParts }
     ]);
   }
 
@@ -562,7 +584,41 @@ async function run() {
   }
 
   {
-    console.log("\n[11] shutdown");
+    console.log("\n[11] does not complete jobs on stable partial assistant output");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "partial-then-final please", wait_ms: 60 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "partial model call returns a running job");
+        assert(!!jobId, "partial model response includes job_id");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 120 } } });
+        const partial = await srv.waitForResponse(3);
+        const partialText = partial?.result?.content?.[0]?.text || "";
+        assert(partialText.includes("Opencode job is still running."), "stable partial output remains pollable");
+        assert(partialText.includes("PARTIAL: still investigating"), "partial output is reported as latest partial");
+
+        await new Promise(r => setTimeout(r, 260));
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(4);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("FINAL: model=deepseek/deepseek-chat complete"), "final output is returned after completion signal");
+
+        await srv.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 50 } } });
+        const cached = await srv.waitForResponse(5);
+        const cachedText = cached?.result?.content?.[0]?.text || "";
+        assert(cachedText.includes("FINAL: model=deepseek/deepseek-chat complete"), "completed output is cached for repeat polls");
+      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[12] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
