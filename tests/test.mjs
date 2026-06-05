@@ -127,7 +127,12 @@ const server = http.createServer(async (req, res) => {
       session.response = "chat dir=" + session.directory + " OK";
     }
     session.prompt = prompt;
-    session.readyAt = prompt.includes("slow-response") ? Date.now() + 180 : Date.now();
+    const submitDelay = prompt.includes("slow-submit") ? 180 : 0;
+    session.readyAt = prompt.includes("slow-response") || submitDelay ? Date.now() + 180 : Date.now();
+    if (submitDelay) {
+      setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
+      return;
+    }
     return send(res, 200, { id: "m1" });
   }
 
@@ -529,7 +534,35 @@ async function run() {
   }
 
   {
-    console.log("\n[10] shutdown");
+    console.log("\n[10] returns a pollable job while initial message submit is still pending");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "slow-submit please", wait_ms: 60 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "slow submit returns running job instead of API timeout");
+        assert(startedText.includes("submit_status: pending"), "running job reports pending message submit");
+        assert(!!jobId, "slow submit response includes job_id");
+
+        await new Promise(r => setTimeout(r, 240));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(3);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("model=deepseek/deepseek-chat"), "opencode_job status returns completed output after slow submit");
+      }, {
+        OPENCODE_API_TIMEOUT_MS: "50",
+        OPENCODE_MESSAGE_TIMEOUT_MS: "500",
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[11] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

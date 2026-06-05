@@ -1,5 +1,10 @@
 # Changelog
 
+## 5.4.4 (2026-06-05)
+
+- **Long prompt submission fix**: Initial `POST /session/:id/message` submission now runs asynchronously after session creation, so slow repo-aware prompts can return a pollable job instead of failing before a job exists.
+- **Message submit timeout**: Added `OPENCODE_MESSAGE_TIMEOUT_MS` (default `120000`) for initial message submission while keeping regular opencode API calls on `OPENCODE_API_TIMEOUT_MS`.
+
 ## 5.4.3 (2026-06-05)
 
 - **Installer idempotency**: Re-running `scripts/setup.sh` with `OPENCODE_MCP_CODEX_BRIDGE_PATH` now syncs the copied bridge even when the requested version is already installed.

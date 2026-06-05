@@ -17,7 +17,8 @@
  *   OPENCODE_MCP_SKIP         comma-sep MCP names            (default: none)
  *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
  *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 60000)
- *   OPENCODE_API_TIMEOUT_MS   max wait for one opencode HTTP call (default: 10000)
+ *   OPENCODE_API_TIMEOUT_MS   max wait for one regular opencode HTTP call (default: 10000)
+ *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial message submission (default: 120000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -34,7 +35,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.3";
+const VERSION = "5.4.4";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -85,6 +86,7 @@ const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.tr
 const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
 const RETURN_TIMEOUT = parseInt(process.env.OPENCODE_MCP_RETURN_TIMEOUT_MS) || 60_000;
 const API_TIMEOUT = parseInt(process.env.OPENCODE_API_TIMEOUT_MS) || 10_000;
+const MESSAGE_TIMEOUT = parseInt(process.env.OPENCODE_MESSAGE_TIMEOUT_MS) || Math.max(API_TIMEOUT, 120_000);
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
@@ -642,6 +644,30 @@ class OpencodeHub {
     return Math.min(parsed, RETURN_TIMEOUT);
   }
 
+  _beginMessageSubmit(job, msgBody) {
+    job.submitDone = false;
+    job.submitError = null;
+    job.submitStartedAt = Date.now();
+    job.submitPromise = this._api(
+      "POST",
+      `/session/${job.sid}/message`,
+      msgBody,
+      { directory: job.directory },
+      MESSAGE_TIMEOUT,
+    )
+      .then((result) => {
+        job.submitDone = true;
+        job.submitResult = result;
+        return result;
+      })
+      .catch((error) => {
+        job.submitDone = true;
+        job.submitError = error;
+        log(`Message submit failed for session ${job.sid}: ${error.message}`);
+        return null;
+      });
+  }
+
   async _createOpencodeJob(agent, model, prompt, directory, context = "cwd") {
     await this._ensureOpencode();
     const dir = this._resolveDirectory(directory, context, "cwd");
@@ -660,8 +686,7 @@ class OpencodeHub {
       msgBody.model = this._parseModel(resolvedModel);
     }
 
-    await this._api("POST", `/session/${sid}/message`, msgBody, { directory: dir });
-    return {
+    const job = {
       id: sid,
       sid,
       agent: agent || null,
@@ -672,6 +697,8 @@ class OpencodeHub {
       last: "",
       lastMessageCount: 0,
     };
+    this._beginMessageSubmit(job, msgBody);
+    return job;
   }
 
   async _opencodeCall(agent, model, prompt, directory, context = "cwd", options = {}) {
@@ -713,6 +740,17 @@ class OpencodeHub {
     }
 
     while (Date.now() - start < maxWaitMs && totalElapsed() < TOOL_TIMEOUT) {
+      if (job.submitError && !last) {
+        try { await this._api("DELETE", `/session/${sid}`); } catch {}
+        this._jobs.delete(job.id);
+        return {
+          status: "timeout",
+          elapsed: totalElapsed(),
+          last,
+          text: `Error submitting opencode message: ${job.submitError.message}`,
+        };
+      }
+
       // Detect if opencode server process died
       if (this._openServerExitCode != null) {
         const msg = `Opencode server exited with code ${this._openServerExitCode}`;
@@ -820,6 +858,9 @@ class OpencodeHub {
       "Poll with:",
       JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: 30000 } }),
     ];
+    if (!job.submitDone) {
+      lines.splice(4, 0, "submit_status: pending");
+    }
     if (result.last) {
       lines.push("", "Latest partial output:", result.last.slice(0, 4000));
     }
@@ -833,6 +874,7 @@ class OpencodeHub {
       model: job.model,
       age_ms: Date.now() - job.createdAt,
       has_partial: !!job.last,
+      submit_pending: !job.submitDone,
     }));
     return JSON.stringify({ jobs }, null, 2);
   }
