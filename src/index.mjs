@@ -22,6 +22,7 @@
  *   OPENCODE_COMPLETED_JOB_TTL_MS keep completed job output available for repeat polls (default: 600000)
  *   OPENCODE_STABLE_COMPLETION_MS legacy no-completion-signal fallback delay (default: 30000)
  *   OPENCODE_PROGRESS_STALE_MS warn when no model/session progress is observed (default: 120000)
+ *   OPENCODE_STALE_TIMEOUT_MS fail and clean up stale jobs after no progress; 0 disables (default: 180000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -38,7 +39,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.8";
+const VERSION = "5.4.9";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -93,6 +94,12 @@ const MESSAGE_TIMEOUT = parseInt(process.env.OPENCODE_MESSAGE_TIMEOUT_MS) || Mat
 const COMPLETED_JOB_TTL = parseInt(process.env.OPENCODE_COMPLETED_JOB_TTL_MS) || 600_000;
 const STABLE_COMPLETION_MS = parseInt(process.env.OPENCODE_STABLE_COMPLETION_MS) || 30_000;
 const PROGRESS_STALE_MS = parseInt(process.env.OPENCODE_PROGRESS_STALE_MS) || 120_000;
+const STALE_TIMEOUT_MS = (() => {
+  const raw = process.env.OPENCODE_STALE_TIMEOUT_MS;
+  if (raw === "0") return 0;
+  const parsed = Number.parseInt(raw || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
+})();
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
@@ -861,6 +868,85 @@ class OpencodeHub {
     return job.progress;
   }
 
+  _jobProgressStats(job) {
+    const progress = job.progress || {};
+    const now = Date.now();
+    const lastProgressAt = progress.last_progress_at || job.lastProgressAt || job.createdAt || now;
+    const lastPollAt = progress.last_poll_at || null;
+    return {
+      progress,
+      lastProgressAt,
+      lastPollAt,
+      lastActivityAge: Math.max(0, now - lastProgressAt),
+      lastPollAge: lastPollAt ? Math.max(0, now - lastPollAt) : null,
+    };
+  }
+
+  _isStaleTimedOut(job) {
+    if (!STALE_TIMEOUT_MS) return false;
+    const { lastActivityAge } = this._jobProgressStats(job);
+    return lastActivityAge >= STALE_TIMEOUT_MS;
+  }
+
+  _formatProgressLines(job, result = {}) {
+    const { progress, lastActivityAge, lastPollAge } = this._jobProgressStats(job);
+    return [
+      `elapsed_ms: ${Math.max(0, Math.round(result.elapsed || 0))}`,
+      `phase: ${progress.phase || (job.submitDone ? "waiting_for_messages" : "submitting")}`,
+      `last_progress_ms_ago: ${lastActivityAge}`,
+      `last_poll_ms_ago: ${lastPollAge === null ? "never" : lastPollAge}`,
+      `poll_count: ${progress.poll_count || job.pollCount || 0}`,
+      `messages: ${progress.message_count || 0}`,
+      `assistant_messages: ${progress.assistant_count || 0}`,
+      `tool_parts: ${progress.tool_part_count || 0}`,
+      `latest_assistant_index: ${progress.latest_assistant_index ?? -1}`,
+      `latest_assistant_complete: ${!!progress.latest_assistant_complete}`,
+      `latest_assistant_tool_call_turn: ${!!progress.latest_assistant_tool_call_turn}`,
+      `latest_assistant_finish_reason: ${progress.latest_assistant_finish_reason || ""}`,
+      `latest_assistant_text_chars: ${progress.latest_assistant_text_chars || 0}`,
+    ];
+  }
+
+  _formatProgressNotes(job) {
+    const { progress, lastActivityAge } = this._jobProgressStats(job);
+    const lines = [];
+    if (job.lastPollError) {
+      lines.push(`last_poll_error: ${job.lastPollError}`);
+    }
+    if (progress.phase === "tool_call_complete_waiting_for_followup") {
+      lines.push("progress_note: latest assistant turn completed with tool calls; waiting for follow-up assistant text.");
+    }
+    if (lastActivityAge >= PROGRESS_STALE_MS) {
+      lines.push(`stale_warning: no session progress for ${lastActivityAge}ms`);
+    }
+    if (this._isStaleTimedOut(job)) {
+      lines.push(`stale_timeout: no session progress for ${lastActivityAge}ms; threshold=${STALE_TIMEOUT_MS}ms`);
+    }
+    return lines;
+  }
+
+  _formatStaleJobTimeout(job, elapsed, last) {
+    const lines = [
+      "Opencode job marked stale and stopped.",
+      `job_id: ${job.id}`,
+      "status: stale_timeout",
+      ...this._formatProgressLines(job, { elapsed }),
+      ...this._formatProgressNotes(job),
+    ];
+    if (last) {
+      lines.push("", "Latest partial output:", last.slice(0, 4000));
+    }
+    return lines.join("\n");
+  }
+
+  async _completeStaleJob(job, sid, elapsed, last) {
+    try { await this._api("DELETE", `/session/${sid}`); } catch {}
+    const text = this._formatStaleJobTimeout(job, elapsed, last);
+    const result = { status: "stale_timeout", elapsed, last, text };
+    this._completeActiveJob(job, result);
+    return result;
+  }
+
   _pruneCompletedJobs() {
     const now = Date.now();
     for (const [jobId, completed] of this._completedJobs.entries()) {
@@ -931,7 +1017,7 @@ class OpencodeHub {
       deleteOnComplete: true,
     });
 
-    if (result.status === "complete" || result.status === "timeout") {
+    if (result.status === "complete" || result.status === "timeout" || result.status === "stale_timeout") {
       return result.text;
     }
 
@@ -1043,6 +1129,10 @@ class OpencodeHub {
         break;
       }
 
+      if (this._isStaleTimedOut(job)) {
+        return await this._completeStaleJob(job, sid, totalElapsed(), last);
+      }
+
       // New messages arrived → reset stability
       if (msgs.length > prev) {
         prev = msgs.length;
@@ -1087,49 +1177,26 @@ class OpencodeHub {
       return result;
     }
 
+    if (this._isStaleTimedOut(job)) {
+      return await this._completeStaleJob(job, sid, elapsed, last);
+    }
+
     job.last = last;
     job.lastMessageCount = prev;
     return { status: "running", elapsed, last, reason: "return_timeout" };
   }
 
   _formatRunningJob(job, result = {}) {
-    const progress = job.progress || {};
-    const now = Date.now();
-    const lastProgressAt = progress.last_progress_at || job.lastProgressAt || job.createdAt || now;
-    const lastPollAt = progress.last_poll_at || null;
-    const lastActivityAge = Math.max(0, now - lastProgressAt);
-    const lastPollAge = lastPollAt ? Math.max(0, now - lastPollAt) : null;
-    const isStale = lastActivityAge >= PROGRESS_STALE_MS;
     const lines = [
       "Opencode job is still running.",
       `job_id: ${job.id}`,
       `status: running`,
-      `elapsed_ms: ${Math.max(0, Math.round(result.elapsed || 0))}`,
-      `phase: ${progress.phase || (job.submitDone ? "waiting_for_messages" : "submitting")}`,
-      `last_progress_ms_ago: ${lastActivityAge}`,
-      `last_poll_ms_ago: ${lastPollAge === null ? "never" : lastPollAge}`,
-      `poll_count: ${progress.poll_count || job.pollCount || 0}`,
-      `messages: ${progress.message_count || 0}`,
-      `assistant_messages: ${progress.assistant_count || 0}`,
-      `tool_parts: ${progress.tool_part_count || 0}`,
-      `latest_assistant_index: ${progress.latest_assistant_index ?? -1}`,
-      `latest_assistant_complete: ${!!progress.latest_assistant_complete}`,
-      `latest_assistant_tool_call_turn: ${!!progress.latest_assistant_tool_call_turn}`,
-      `latest_assistant_finish_reason: ${progress.latest_assistant_finish_reason || ""}`,
-      `latest_assistant_text_chars: ${progress.latest_assistant_text_chars || 0}`,
+      ...this._formatProgressLines(job, result),
+      ...this._formatProgressNotes(job),
       "",
       "Poll with:",
       JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: 30000 } }),
     ];
-    if (isStale) {
-      lines.splice(16, 0, `stale_warning: no session progress for ${lastActivityAge}ms`);
-    }
-    if (progress.phase === "tool_call_complete_waiting_for_followup") {
-      lines.splice(16, 0, "progress_note: latest assistant turn completed with tool calls; waiting for follow-up assistant text.");
-    }
-    if (job.lastPollError) {
-      lines.splice(16, 0, `last_poll_error: ${job.lastPollError}`);
-    }
     if (!job.submitDone) {
       lines.splice(4, 0, "submit_status: pending");
     }
@@ -1189,7 +1256,7 @@ class OpencodeHub {
       deleteOnComplete: true,
     });
 
-    if (result.status === "complete" || result.status === "timeout") return result.text;
+    if (result.status === "complete" || result.status === "timeout" || result.status === "stale_timeout") return result.text;
     this._jobs.set(job.id, job);
     return this._formatRunningJob(job, result);
   }

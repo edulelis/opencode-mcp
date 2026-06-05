@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.4.9 (2026-06-05)
+
+- **Auto stale timeout**: Jobs with no observed session progress are now stopped and finalized as `stale_timeout` diagnostics instead of requiring a manual cancel.
+- **Cached stale diagnostics**: Stale-timeout results keep the latest partial output and remain available through repeat `opencode_job status` polls for the completed-job TTL.
+- **Config**: Added `OPENCODE_STALE_TIMEOUT_MS` (default `180000`); set it to `0` to disable auto stale finalization.
+
 ## 5.4.8 (2026-06-05)
 
 - **Progress diagnostics**: Running job status now reports phase, poll count, message/assistant counts, tool-call state, finish reason, last progress age, and stale warnings.

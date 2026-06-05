@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.8/opencode-mcp-v5.4.8.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.9/opencode-mcp-v5.4.9.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.8/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.9/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -184,7 +184,7 @@ You can also start a call in the background immediately:
 }
 ```
 
-Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion.
+Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion. Jobs that stop making session progress are finalized as `stale_timeout` diagnostics by default, with their latest partial output retained for debugging.
 
 ### 5. List resources
 
@@ -238,6 +238,8 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_MESSAGE_TIMEOUT_MS` | `120000` | Max wait for initial async opencode message submission |
 | `OPENCODE_COMPLETED_JOB_TTL_MS` | `600000` | How long completed job output remains available for repeat `opencode_job status` polls |
 | `OPENCODE_STABLE_COMPLETION_MS` | `30000` | Legacy fallback delay before treating stable output as complete when opencode does not expose completion metadata |
+| `OPENCODE_PROGRESS_STALE_MS` | `120000` | Age of last session progress before running jobs report stale warnings |
+| `OPENCODE_STALE_TIMEOUT_MS` | `180000` | Age of last session progress before stale jobs are stopped and finalized; set `0` to disable |
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |

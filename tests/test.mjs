@@ -725,7 +725,47 @@ async function run() {
   }
 
   {
-    console.log("\n[14] shutdown");
+    console.log("\n[14] auto-finalizes stale tool-call jobs with diagnostics");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "tool-step-stalled please", background: true } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "background stalled tool-call starts as running");
+        assert(!!jobId, "background stalled tool-call includes job_id");
+
+        await new Promise(r => setTimeout(r, 120));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 300 } } });
+        const stale = await srv.waitForResponse(3);
+        const staleText = stale?.result?.content?.[0]?.text || "";
+        assert(staleText.includes("Opencode job marked stale and stopped."), "stale tool-call job is finalized automatically");
+        assert(staleText.includes("status: stale_timeout"), "stale tool-call reports terminal stale_timeout status");
+        assert(staleText.includes("stale_timeout: no session progress"), "stale tool-call reports stale timeout diagnostic");
+        assert(staleText.includes("Latest partial output:"), "stale timeout keeps partial output for diagnosis");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 50 } } });
+        const cached = await srv.waitForResponse(4);
+        const cachedText = cached?.result?.content?.[0]?.text || "";
+        assert(cachedText.includes("Opencode job marked stale and stopped."), "stale timeout result is cached for repeat polls");
+
+        await srv.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "opencode_job", arguments: { action: "list" } } });
+        const listed = await srv.waitForResponse(5);
+        const listedText = listed?.result?.content?.[0]?.text || "";
+        assert(listedText.includes('"jobs": []'), "stale timeout removes job from active list");
+      }, {
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+        OPENCODE_PROGRESS_STALE_MS: "40",
+        OPENCODE_STALE_TIMEOUT_MS: "80",
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[15] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
