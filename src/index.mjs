@@ -21,6 +21,7 @@
  *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial async message submission (default: 120000)
  *   OPENCODE_COMPLETED_JOB_TTL_MS keep completed job output available for repeat polls (default: 600000)
  *   OPENCODE_STABLE_COMPLETION_MS legacy no-completion-signal fallback delay (default: 30000)
+ *   OPENCODE_PROGRESS_STALE_MS warn when no model/session progress is observed (default: 120000)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -37,7 +38,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.7";
+const VERSION = "5.4.8";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -91,6 +92,7 @@ const API_TIMEOUT = parseInt(process.env.OPENCODE_API_TIMEOUT_MS) || 10_000;
 const MESSAGE_TIMEOUT = parseInt(process.env.OPENCODE_MESSAGE_TIMEOUT_MS) || Math.max(API_TIMEOUT, 120_000);
 const COMPLETED_JOB_TTL = parseInt(process.env.OPENCODE_COMPLETED_JOB_TTL_MS) || 600_000;
 const STABLE_COMPLETION_MS = parseInt(process.env.OPENCODE_STABLE_COMPLETION_MS) || 30_000;
+const PROGRESS_STALE_MS = parseInt(process.env.OPENCODE_PROGRESS_STALE_MS) || 120_000;
 const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
 const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
 const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
@@ -653,6 +655,23 @@ class OpencodeHub {
     job.submitDone = false;
     job.submitError = null;
     job.submitStartedAt = Date.now();
+    job.lastProgressAt = job.submitStartedAt;
+    job.progressSignature = "";
+    job.pollCount = 0;
+    job.progress = {
+      phase: "submitting",
+      message_count: 0,
+      assistant_count: 0,
+      tool_part_count: 0,
+      latest_assistant_index: -1,
+      latest_assistant_complete: false,
+      latest_assistant_tool_call_turn: false,
+      latest_assistant_finish_reason: "",
+      latest_assistant_text_chars: 0,
+      last_poll_at: null,
+      last_progress_at: job.lastProgressAt,
+      poll_count: 0,
+    };
     const submitAsync = () =>
       this._api(
         "POST",
@@ -678,12 +697,22 @@ class OpencodeHub {
       })
       .then((result) => {
         job.submitDone = true;
+        job.submitCompletedAt = Date.now();
+        this._updateJobProgress(job, {
+          ...(job.progress || {}),
+          phase: "submitted_waiting_for_messages",
+        });
         job.submitResult = result;
         return result;
       })
       .catch((error) => {
         job.submitDone = true;
+        job.submitCompletedAt = Date.now();
         job.submitError = error;
+        this._updateJobProgress(job, {
+          ...(job.progress || {}),
+          phase: "submit_error",
+        });
         log(`Message submit failed for session ${job.sid}: ${error.message}`);
         return null;
       });
@@ -720,6 +749,13 @@ class OpencodeHub {
     return this._messageFinishReason(message) === "tool-calls" || this._hasToolCallParts(message);
   }
 
+  _countParts(messages, type) {
+    return messages.reduce((count, message) => {
+      if (!Array.isArray(message?.parts)) return count;
+      return count + message.parts.filter((part) => part?.type === type).length;
+    }, 0);
+  }
+
   _extractMessageText(message) {
     const parts = message?.parts;
     if (Array.isArray(parts)) {
@@ -747,6 +783,9 @@ class OpencodeHub {
         index: -1,
         text: "",
         complete: false,
+        toolCallTurn: false,
+        finishReason: "",
+        toolPartCount: 0,
         hasLatestAssistant: false,
       };
     }
@@ -757,8 +796,69 @@ class OpencodeHub {
       text: text && text !== prompt ? text : "",
       complete: this._isAssistantMessageComplete(latestAssistant),
       toolCallTurn: this._isToolCallTurn(latestAssistant),
+      finishReason: this._messageFinishReason(latestAssistant),
+      toolPartCount: this._countParts([latestAssistant], "tool"),
       hasLatestAssistant: true,
     };
+  }
+
+  _progressPhase(job, latestAssistant, messageCount) {
+    if (!job.submitDone) return "submitting";
+    if (job.submitError) return "submit_error";
+    if (messageCount === 0) return "waiting_for_messages";
+    if (!latestAssistant.hasLatestAssistant) return "waiting_for_assistant";
+    if (latestAssistant.toolCallTurn) {
+      return latestAssistant.complete
+        ? "tool_call_complete_waiting_for_followup"
+        : "running_tools";
+    }
+    if (latestAssistant.text && latestAssistant.complete) return "final_text_complete";
+    if (latestAssistant.text) return "receiving_text";
+    return "waiting_for_assistant_text";
+  }
+
+  _buildProgressSnapshot(job, messages, latestAssistant) {
+    const assistantCount = messages.filter((message) => this._isAssistantMessage(message)).length;
+    return {
+      phase: this._progressPhase(job, latestAssistant, messages.length),
+      message_count: messages.length,
+      assistant_count: assistantCount,
+      tool_part_count: this._countParts(messages, "tool"),
+      latest_assistant_index: latestAssistant.index,
+      latest_assistant_complete: !!latestAssistant.complete,
+      latest_assistant_tool_call_turn: !!latestAssistant.toolCallTurn,
+      latest_assistant_finish_reason: latestAssistant.finishReason || "",
+      latest_assistant_text_chars: latestAssistant.text?.length || 0,
+      last_poll_at: Date.now(),
+      last_progress_at: job.lastProgressAt || job.createdAt || Date.now(),
+      poll_count: job.pollCount || 0,
+    };
+  }
+
+  _updateJobProgress(job, snapshot) {
+    const now = Date.now();
+    const signature = JSON.stringify([
+      snapshot.phase,
+      snapshot.message_count,
+      snapshot.assistant_count,
+      snapshot.tool_part_count,
+      snapshot.latest_assistant_index,
+      snapshot.latest_assistant_complete,
+      snapshot.latest_assistant_tool_call_turn,
+      snapshot.latest_assistant_finish_reason,
+      snapshot.latest_assistant_text_chars,
+    ]);
+    if (signature !== job.progressSignature) {
+      job.lastProgressAt = now;
+      job.progressSignature = signature;
+    }
+    job.progress = {
+      ...snapshot,
+      last_poll_at: snapshot.last_poll_at || now,
+      last_progress_at: job.lastProgressAt || now,
+      poll_count: job.pollCount || 0,
+    };
+    return job.progress;
   }
 
   _pruneCompletedJobs() {
@@ -890,10 +990,19 @@ class OpencodeHub {
         msgs = await this._api("GET", `/session/${sid}/message`, undefined, undefined, Math.min(API_TIMEOUT, remainingForPoll));
       } catch (e) {
         log(`Poll error: ${e.message}`);
+        job.lastPollError = e.message;
+        job.lastPollErrorAt = Date.now();
+        this._updateJobProgress(job, {
+          ...(job.progress || {}),
+          phase: "poll_error",
+          last_poll_at: Date.now(),
+        });
         continue; // transient, retry
       }
 
       if (!Array.isArray(msgs)) continue;
+      job.pollCount = (job.pollCount || 0) + 1;
+      job.lastPollError = null;
 
       // Check for assistant error on any message
       for (const m of msgs) {
@@ -909,6 +1018,7 @@ class OpencodeHub {
       }
 
       const latestAssistant = this._latestAssistantState(msgs, prompt);
+      this._updateJobProgress(job, this._buildProgressSnapshot(job, msgs, latestAssistant));
       let resp = latestAssistant.text;
       let assistantComplete = latestAssistant.complete && !!latestAssistant.text && !latestAssistant.toolCallTurn;
       if (!resp && !latestAssistant.hasLatestAssistant) {
@@ -983,15 +1093,43 @@ class OpencodeHub {
   }
 
   _formatRunningJob(job, result = {}) {
+    const progress = job.progress || {};
+    const now = Date.now();
+    const lastProgressAt = progress.last_progress_at || job.lastProgressAt || job.createdAt || now;
+    const lastPollAt = progress.last_poll_at || null;
+    const lastActivityAge = Math.max(0, now - lastProgressAt);
+    const lastPollAge = lastPollAt ? Math.max(0, now - lastPollAt) : null;
+    const isStale = lastActivityAge >= PROGRESS_STALE_MS;
     const lines = [
       "Opencode job is still running.",
       `job_id: ${job.id}`,
       `status: running`,
       `elapsed_ms: ${Math.max(0, Math.round(result.elapsed || 0))}`,
+      `phase: ${progress.phase || (job.submitDone ? "waiting_for_messages" : "submitting")}`,
+      `last_progress_ms_ago: ${lastActivityAge}`,
+      `last_poll_ms_ago: ${lastPollAge === null ? "never" : lastPollAge}`,
+      `poll_count: ${progress.poll_count || job.pollCount || 0}`,
+      `messages: ${progress.message_count || 0}`,
+      `assistant_messages: ${progress.assistant_count || 0}`,
+      `tool_parts: ${progress.tool_part_count || 0}`,
+      `latest_assistant_index: ${progress.latest_assistant_index ?? -1}`,
+      `latest_assistant_complete: ${!!progress.latest_assistant_complete}`,
+      `latest_assistant_tool_call_turn: ${!!progress.latest_assistant_tool_call_turn}`,
+      `latest_assistant_finish_reason: ${progress.latest_assistant_finish_reason || ""}`,
+      `latest_assistant_text_chars: ${progress.latest_assistant_text_chars || 0}`,
       "",
       "Poll with:",
       JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: 30000 } }),
     ];
+    if (isStale) {
+      lines.splice(16, 0, `stale_warning: no session progress for ${lastActivityAge}ms`);
+    }
+    if (progress.phase === "tool_call_complete_waiting_for_followup") {
+      lines.splice(16, 0, "progress_note: latest assistant turn completed with tool calls; waiting for follow-up assistant text.");
+    }
+    if (job.lastPollError) {
+      lines.splice(16, 0, `last_poll_error: ${job.lastPollError}`);
+    }
     if (!job.submitDone) {
       lines.splice(4, 0, "submit_status: pending");
     }
@@ -1004,12 +1142,20 @@ class OpencodeHub {
   _formatJobList() {
     this._pruneCompletedJobs();
     const jobs = [...this._jobs.values()].map((job) => ({
+      ...(job.progress ? { progress: job.progress } : {}),
       job_id: job.id,
       agent: job.agent,
       model: job.model,
       age_ms: Date.now() - job.createdAt,
       has_partial: !!job.last,
       submit_pending: !job.submitDone,
+      phase: job.progress?.phase || (job.submitDone ? "waiting_for_messages" : "submitting"),
+      last_progress_ms_ago: Math.max(0, Date.now() - (job.progress?.last_progress_at || job.lastProgressAt || job.createdAt)),
+      stale: Math.max(0, Date.now() - (job.progress?.last_progress_at || job.lastProgressAt || job.createdAt)) >= PROGRESS_STALE_MS,
+      message_count: job.progress?.message_count || 0,
+      assistant_count: job.progress?.assistant_count || 0,
+      tool_part_count: job.progress?.tool_part_count || 0,
+      latest_assistant_tool_call_turn: !!job.progress?.latest_assistant_tool_call_turn,
     }));
     const completed_jobs = [...this._completedJobs.values()].map((job) => ({
       job_id: job.job_id,

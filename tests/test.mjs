@@ -699,6 +699,11 @@ async function run() {
         const jobId = startedText.match(/job_id: (\S+)/)?.[1];
         assert(startedText.includes("Opencode job is still running."), "stalled tool-call turn remains a running job");
         assert(!!jobId, "stalled tool-call response includes job_id");
+        assert(startedText.includes("phase: tool_call_complete_waiting_for_followup"), "stalled tool-call status reports explicit phase");
+        assert(startedText.includes("messages: 2"), "stalled tool-call status reports message count");
+        assert(startedText.includes("assistant_messages: 1"), "stalled tool-call status reports assistant count");
+        assert(startedText.includes("tool_parts: 2"), "stalled tool-call status reports tool-call part count");
+        assert(startedText.includes("progress_note: latest assistant turn completed with tool calls"), "stalled tool-call status explains wait state");
         assert(startedText.includes("Latest partial output:"), "stalled tool-call response can show partial context");
         assert(startedText.includes("I'll investigate the repo in parallel."), "stalled tool-call partial text is available only as partial output");
 
@@ -707,7 +712,13 @@ async function run() {
         const listed = await srv.waitForResponse(3);
         const listedText = listed?.result?.content?.[0]?.text || "";
         assert(listedText.includes(jobId), "stalled tool-call job is still tracked, not cached as completed");
-      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+        assert(listedText.includes('"phase": "tool_call_complete_waiting_for_followup"'), "job list reports progress phase");
+        assert(listedText.includes('"stale": true'), "job list marks stale jobs after threshold");
+        assert(listedText.includes('"tool_part_count": 2'), "job list includes compact tool-call count");
+      }, {
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+        OPENCODE_PROGRESS_STALE_MS: "80",
+      });
     } finally {
       fix.cleanup();
     }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.4.8 (2026-06-05)
+
+- **Progress diagnostics**: Running job status now reports phase, poll count, message/assistant counts, tool-call state, finish reason, last progress age, and stale warnings.
+- **Job list diagnostics**: `opencode_job list` now includes compact progress metadata for every active job.
+- **Stuck-job visibility**: Completed tool-call turns that are waiting for follow-up assistant text are now shown explicitly instead of requiring log inspection.
+
 ## 5.4.7 (2026-06-05)
 
 - **Tool-call completion guard**: Completed assistant turns that end with `finish: "tool-calls"` or contain tool-call parts are now treated as interim progress, not final output.
