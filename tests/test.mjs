@@ -142,6 +142,11 @@ const server = http.createServer(async (req, res) => {
       session.finalAt = Date.now() + 280;
       session.toolStepFinal = true;
     }
+    if (prompt.includes("tool-step-stalled")) {
+      session.response = "I'll investigate the repo in parallel.";
+      session.readyAt = Date.now();
+      session.toolStepStalled = true;
+    }
     if (submitDelay && url.pathname.endsWith("/message")) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
@@ -151,19 +156,19 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname.endsWith("/message")) {
     const now = Date.now();
-    if (session.toolStepFinal) {
+    if (session.toolStepFinal || session.toolStepStalled) {
       const finalComplete = now >= session.finalAt;
-      const firstAssistantInfo = { role: "assistant", time: { created: session.createdAt + 1, completed: session.createdAt + 2 } };
+      const firstAssistantInfo = { role: "assistant", finish: "tool-calls", time: { created: session.createdAt + 1, completed: session.createdAt + 2 } };
       const secondAssistantInfo = { role: "assistant", time: { created: session.createdAt + 3 } };
-      const secondAssistantParts = finalComplete
+      const secondAssistantParts = finalComplete && !session.toolStepStalled
         ? [
             { type: "step-start" },
             { type: "text", text: session.finalResponse },
             { type: "step-finish" }
           ]
         : [];
-      if (finalComplete) secondAssistantInfo.time.completed = now;
-      return send(res, 200, [
+      if (finalComplete && !session.toolStepStalled) secondAssistantInfo.time.completed = now;
+      const messages = [
         { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
         {
           info: firstAssistantInfo,
@@ -174,9 +179,12 @@ const server = http.createServer(async (req, res) => {
             { type: "tool", id: "read-2" },
             { type: "step-finish" }
           ]
-        },
-        { info: secondAssistantInfo, parts: secondAssistantParts }
-      ]);
+        }
+      ];
+      if (!session.toolStepStalled) {
+        messages.push({ info: secondAssistantInfo, parts: secondAssistantParts });
+      }
+      return send(res, 200, messages);
     }
 
     let assistantText = "";
@@ -681,7 +689,32 @@ async function run() {
   }
 
   {
-    console.log("\n[13] shutdown");
+    console.log("\n[13] keeps stalled tool-call turns running instead of finalizing interim text");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "tool-step-stalled please", wait_ms: 140 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "stalled tool-call turn remains a running job");
+        assert(!!jobId, "stalled tool-call response includes job_id");
+        assert(startedText.includes("Latest partial output:"), "stalled tool-call response can show partial context");
+        assert(startedText.includes("I'll investigate the repo in parallel."), "stalled tool-call partial text is available only as partial output");
+
+        await new Promise(r => setTimeout(r, 180));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "list" } } });
+        const listed = await srv.waitForResponse(3);
+        const listedText = listed?.result?.content?.[0]?.text || "";
+        assert(listedText.includes(jobId), "stalled tool-call job is still tracked, not cached as completed");
+      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[14] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

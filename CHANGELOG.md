@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.4.7 (2026-06-05)
+
+- **Tool-call completion guard**: Completed assistant turns that end with `finish: "tool-calls"` or contain tool-call parts are now treated as interim progress, not final output.
+- **Error hardening**: Assistant errors are detected from nested and top-level message shapes, so opencode failures are surfaced instead of cached as successful text.
+- **Tests**: Added a stalled tool-call regression to prevent progress text like "I'll investigate..." from being returned as a completed MCP job.
+
 ## 5.4.6 (2026-06-05)
 
 - **Async submit endpoint**: Initial message submission now uses opencode's `/prompt_async` endpoint, falling back to `/message` only for older servers. This avoids long repo-aware prompts spending minutes inside the submit request.

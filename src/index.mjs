@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.6";
+const VERSION = "5.4.7";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -702,6 +702,24 @@ class OpencodeHub {
     return typeof completed === "number" && Number.isFinite(completed);
   }
 
+  _messageError(message) {
+    const info = this._messageInfo(message) || {};
+    return info.error || message?.error || message?.data?.error || null;
+  }
+
+  _messageFinishReason(message) {
+    const info = this._messageInfo(message) || {};
+    return info.finish || message?.finish || message?.data?.finish || "";
+  }
+
+  _hasToolCallParts(message) {
+    return Array.isArray(message?.parts) && message.parts.some((part) => part?.type === "tool");
+  }
+
+  _isToolCallTurn(message) {
+    return this._messageFinishReason(message) === "tool-calls" || this._hasToolCallParts(message);
+  }
+
   _extractMessageText(message) {
     const parts = message?.parts;
     if (Array.isArray(parts)) {
@@ -738,6 +756,7 @@ class OpencodeHub {
       index: latestAssistantIndex,
       text: text && text !== prompt ? text : "",
       complete: this._isAssistantMessageComplete(latestAssistant),
+      toolCallTurn: this._isToolCallTurn(latestAssistant),
       hasLatestAssistant: true,
     };
   }
@@ -878,9 +897,8 @@ class OpencodeHub {
 
       // Check for assistant error on any message
       for (const m of msgs) {
-        const info = m.info || {};
-        if (info.role === "assistant" && info.error) {
-          const err = info.error;
+        if (this._isAssistantMessage(m) && this._messageError(m)) {
+          const err = this._messageError(m);
           const detail = err.data?.message || err.name || JSON.stringify(err);
           log(`Assistant error: ${detail}`);
           try { await this._api("DELETE", `/session/${sid}`); } catch {}
@@ -892,7 +910,7 @@ class OpencodeHub {
 
       const latestAssistant = this._latestAssistantState(msgs, prompt);
       let resp = latestAssistant.text;
-      let assistantComplete = latestAssistant.complete && !!latestAssistant.text;
+      let assistantComplete = latestAssistant.complete && !!latestAssistant.text && !latestAssistant.toolCallTurn;
       if (!resp && !latestAssistant.hasLatestAssistant) {
         for (const m of msgs) {
           const t = this._extractMessageText(m);
@@ -925,7 +943,7 @@ class OpencodeHub {
 
       // Same message count, content stabilized. This is only a legacy fallback
       // for opencode builds that do not expose assistant.time.completed.
-      if (resp && resp === last) {
+      if (resp && resp === last && !latestAssistant.toolCallTurn) {
         stable++;
         if (stable >= 3 && totalElapsed() >= STABLE_COMPLETION_MS) {
           log(`Session ${sid} stabilized after ${Date.now() - start}ms`);
