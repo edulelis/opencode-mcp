@@ -63,8 +63,9 @@ Hub → Client:  {"result":{"content":[...]}}
 ## Backend Details
 
 ### opencode serve (direct HTTP)
-- Started lazily with `--port=0` (random port)
-- URL captured from `opencode server listening on ...` line
+- Started lazily on a bridge-selected local port and probed over HTTP
+- Backend URL/PID and active opencode job metadata are persisted under `OPENCODE_MCP_STATE_DIR`
+- When active jobs exist, bridge shutdown preserves the opencode server so a restarted bridge can reattach and poll them
 - Communicates via HTTP with Basic Auth
 - Used by the `opencode` tool for agents and model calls
 - Dynamic shortcut tools are generated from `opencode models` as `opencode_model_<provider-or-family>` by default.

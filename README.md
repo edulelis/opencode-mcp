@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.9/opencode-mcp-v5.4.9.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.11/opencode-mcp-v5.4.11.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.9/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.11/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -184,7 +184,7 @@ You can also start a call in the background immediately:
 }
 ```
 
-Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion. Jobs that stop making session progress are finalized as `stale_timeout` diagnostics by default, with their latest partial output retained for debugging.
+Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion. Active jobs are persisted to disk and the bridge preserves the opencode server when it exits, so a job can be polled after the MCP bridge restarts as long as the machine and opencode server process stayed alive. Jobs that stop making session progress stay pollable by default and report stale-warning diagnostics with their latest partial output. Set `OPENCODE_STALE_TIMEOUT_MS` to a positive value if you want stale jobs to be stopped automatically.
 
 ### 5. List resources
 
@@ -232,14 +232,16 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_CONFIG` | auto-detect | Path to opencode.jsonc |
 | `OPENCODE_SERVER_PASSWORD` | from env | Password for opencode serve |
 | `OPENCODE_MCP_SKIP` | none | Comma-separated MCP names to skip from `opencode.jsonc` |
-| `OPENCODE_TOOL_TIMEOUT_MS` | `600000` | Max wait for opencode agent/model calls |
-| `OPENCODE_MCP_RETURN_TIMEOUT_MS` | `60000` | Max synchronous wait before returning a pollable `opencode_job` |
+| `OPENCODE_TOOL_TIMEOUT_MS` | `0` | Max total runtime for opencode agent/model jobs; `0` disables the hard runtime cap |
+| `OPENCODE_MCP_RETURN_TIMEOUT_MS` | `15000` | Max synchronous wait before returning a pollable `opencode_job` |
 | `OPENCODE_API_TIMEOUT_MS` | `10000` | Max wait for one regular opencode HTTP API request |
-| `OPENCODE_MESSAGE_TIMEOUT_MS` | `120000` | Max wait for initial async opencode message submission |
+| `OPENCODE_MESSAGE_TIMEOUT_MS` | `0` | Max wait for fallback `/message` submission on older opencode servers; `0` disables this timeout |
+| `OPENCODE_MCP_STATE_DIR` | `~/.opencode-mcp/state` | Directory for durable active-job state |
+| `OPENCODE_MCP_PRESERVE_JOBS` | `1` | Keep active opencode jobs alive when the MCP bridge exits; set `0` to restore cleanup-on-exit behavior |
 | `OPENCODE_COMPLETED_JOB_TTL_MS` | `600000` | How long completed job output remains available for repeat `opencode_job status` polls |
 | `OPENCODE_STABLE_COMPLETION_MS` | `30000` | Legacy fallback delay before treating stable output as complete when opencode does not expose completion metadata |
 | `OPENCODE_PROGRESS_STALE_MS` | `120000` | Age of last session progress before running jobs report stale warnings |
-| `OPENCODE_STALE_TIMEOUT_MS` | `180000` | Age of last session progress before stale jobs are stopped and finalized; set `0` to disable |
+| `OPENCODE_STALE_TIMEOUT_MS` | `0` | Age of last session progress before stale jobs are stopped and finalized; `0` disables auto-stop |
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |

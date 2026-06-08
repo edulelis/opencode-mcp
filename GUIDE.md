@@ -40,7 +40,7 @@ Run the same command again to update. Existing installs are version-checked, bac
 
 ```bash
 # Download the release zip
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.9/opencode-mcp-v5.4.9.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.11/opencode-mcp-v5.4.11.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 mv ~/opencode-mcp ~/.opencode-mcp
@@ -52,7 +52,7 @@ The entire MCP server is one self-contained file:
 
 ```bash
 mkdir -p ~/.opencode-mcp/src
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.9/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.11/src/index.mjs \
   -o ~/.opencode-mcp/src/index.mjs
 ```
 
@@ -140,6 +140,24 @@ If your MCP client supports explicit tool calls, the schema is:
 { "list": "models" }
 ```
 
+### Long-Running Jobs
+
+Slow model or agent calls return a pollable `job_id` before the MCP client times out:
+
+```text
+Opencode job is still running.
+job_id: s1
+status: running
+```
+
+Poll it with:
+
+```json
+{ "action": "status", "job_id": "s1", "wait_ms": 15000 }
+```
+
+Use `{"action":"list"}` to see active and recently completed jobs, and `{"action":"cancel","job_id":"s1"}` to stop one explicitly. Active jobs are persisted under `~/.opencode-mcp/state` by default, and the bridge preserves the opencode backend when it exits with active jobs, so a restarted MCP bridge can continue polling the same job while the machine and opencode process stay alive.
+
 ## Environment Configuration
 
 The bridge auto-detects most things, but you can override:
@@ -150,6 +168,12 @@ export OPENCODE_BIN=/opt/homebrew/bin/opencode
 
 # Custom config path
 export OPENCODE_CONFIG=~/.config/opencode/opencode.jsonc
+
+# Durable job state directory
+export OPENCODE_MCP_STATE_DIR=~/.opencode-mcp/state
+
+# Keep active jobs alive when the bridge exits. This is the default.
+export OPENCODE_MCP_PRESERVE_JOBS=1
 
 # Debug mode
 export DEBUG=1
@@ -175,15 +199,27 @@ curl -fsSL https://opencode.ai/install | sh
 export OPENCODE_BIN=$(which opencode)
 ```
 
-### Tool call times out (180s)
+### Long job returned a job_id
 
-The model might be slow or the server failed to start.
+This is expected for slow model or agent calls. Poll it:
+
+```json
+{ "action": "status", "job_id": "s1", "wait_ms": 15000 }
+```
+
+Use `{"action":"list"}` if you lost the exact `job_id`.
+
+### Job appears stale but should keep running
+
+Stale warnings mean the bridge has not observed new opencode session progress recently. They do not stop jobs by default.
 
 ```bash
-# Check server logs
+# Optional diagnostics
 export DEBUG=1
 node src/index.mjs
 ```
+
+Set `OPENCODE_STALE_TIMEOUT_MS` only if you explicitly want stale jobs to auto-stop.
 
 ### "API 401" error
 

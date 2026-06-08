@@ -15,14 +15,16 @@
  *   OPENCODE_CONFIG           path to opencode.jsonc         (default: auto-detect)
  *   OPENCODE_SERVER_PASSWORD  for opencode serve             (default: env value)
  *   OPENCODE_MCP_SKIP         comma-sep MCP names            (default: none)
- *   OPENCODE_TOOL_TIMEOUT_MS  max wait for agent/model calls (default: 600000)
- *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 60000)
+ *   OPENCODE_TOOL_TIMEOUT_MS  max total runtime for agent/model jobs; 0 disables (default: 0)
+ *   OPENCODE_MCP_RETURN_TIMEOUT_MS max synchronous wait before returning a pollable job (default: 15000)
  *   OPENCODE_API_TIMEOUT_MS   max wait for one regular opencode HTTP call (default: 10000)
- *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for initial async message submission (default: 120000)
+ *   OPENCODE_MESSAGE_TIMEOUT_MS max wait for fallback /message submission; 0 disables (default: 0)
+ *   OPENCODE_MCP_STATE_DIR     directory for durable job state (default: ~/.opencode-mcp/state)
+ *   OPENCODE_MCP_PRESERVE_JOBS keep active jobs alive when bridge exits (default: 1)
  *   OPENCODE_COMPLETED_JOB_TTL_MS keep completed job output available for repeat polls (default: 600000)
  *   OPENCODE_STABLE_COMPLETION_MS legacy no-completion-signal fallback delay (default: 30000)
  *   OPENCODE_PROGRESS_STALE_MS warn when no model/session progress is observed (default: 120000)
- *   OPENCODE_STALE_TIMEOUT_MS fail and clean up stale jobs after no progress; 0 disables (default: 180000)
+ *   OPENCODE_STALE_TIMEOUT_MS fail and clean up stale jobs after no progress; 0 disables (default: 0)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
@@ -32,14 +34,15 @@
 
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createServer } from "node:net";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.9";
+const VERSION = "5.4.11";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -87,22 +90,28 @@ const CFG = CONFIG_PATH ? loadJSONC(CONFIG_PATH) : {};
 const PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
 const AUTH = "Basic " + Buffer.from("opencode:" + PASSWORD).toString("base64");
 const SKIP_MCPS = (process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean);
-const TOOL_TIMEOUT = parseInt(process.env.OPENCODE_TOOL_TIMEOUT_MS) || 600_000;
-const RETURN_TIMEOUT = parseInt(process.env.OPENCODE_MCP_RETURN_TIMEOUT_MS) || 60_000;
-const API_TIMEOUT = parseInt(process.env.OPENCODE_API_TIMEOUT_MS) || 10_000;
-const MESSAGE_TIMEOUT = parseInt(process.env.OPENCODE_MESSAGE_TIMEOUT_MS) || Math.max(API_TIMEOUT, 120_000);
-const COMPLETED_JOB_TTL = parseInt(process.env.OPENCODE_COMPLETED_JOB_TTL_MS) || 600_000;
-const STABLE_COMPLETION_MS = parseInt(process.env.OPENCODE_STABLE_COMPLETION_MS) || 30_000;
+function envMs(name, defaultValue, { allowZero = false } = {}) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return defaultValue;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || (!allowZero && parsed === 0)) return defaultValue;
+  return parsed;
+}
+
+const TOOL_TIMEOUT = envMs("OPENCODE_TOOL_TIMEOUT_MS", 0, { allowZero: true });
+const RETURN_TIMEOUT = envMs("OPENCODE_MCP_RETURN_TIMEOUT_MS", 15_000, { allowZero: true });
+const API_TIMEOUT = envMs("OPENCODE_API_TIMEOUT_MS", 10_000);
+const MESSAGE_TIMEOUT = envMs("OPENCODE_MESSAGE_TIMEOUT_MS", 0, { allowZero: true });
+const STATE_DIR = process.env.OPENCODE_MCP_STATE_DIR || join(homedir(), ".opencode-mcp", "state");
+const STATE_FILE = join(STATE_DIR, "jobs.json");
+const PRESERVE_JOBS = !["0", "false", "off", "no"].includes(normalizeName(process.env.OPENCODE_MCP_PRESERVE_JOBS || "1"));
+const COMPLETED_JOB_TTL = envMs("OPENCODE_COMPLETED_JOB_TTL_MS", 600_000);
+const STABLE_COMPLETION_MS = envMs("OPENCODE_STABLE_COMPLETION_MS", 30_000);
 const PROGRESS_STALE_MS = parseInt(process.env.OPENCODE_PROGRESS_STALE_MS) || 120_000;
-const STALE_TIMEOUT_MS = (() => {
-  const raw = process.env.OPENCODE_STALE_TIMEOUT_MS;
-  if (raw === "0") return 0;
-  const parsed = Number.parseInt(raw || "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
-})();
-const PROXY_TIMEOUT = parseInt(process.env.OPENCODE_PROXY_TIMEOUT_MS) || 300_000;
-const MODEL_CACHE_MS = parseInt(process.env.OPENCODE_MODEL_CACHE_MS) || 60_000;
-const POLL_INTERVAL = parseInt(process.env.OPENCODE_POLL_INTERVAL_MS) || 2_000;
+const STALE_TIMEOUT_MS = envMs("OPENCODE_STALE_TIMEOUT_MS", 0, { allowZero: true });
+const PROXY_TIMEOUT = envMs("OPENCODE_PROXY_TIMEOUT_MS", 300_000);
+const MODEL_CACHE_MS = envMs("OPENCODE_MODEL_CACHE_MS", 60_000);
+const POLL_INTERVAL = envMs("OPENCODE_POLL_INTERVAL_MS", 2_000);
 const INCLUDE_REASONING = process.env.OPENCODE_INCLUDE_REASONING === "1";
 const ALIAS_TOOLS = normalizeName(process.env.OPENCODE_ALIAS_TOOLS || "providers");
 
@@ -117,6 +126,22 @@ function normalizeName(value) {
 function sanitizeToolName(value) {
   const safe = normalizeName(value).replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
   return safe || "model";
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function pickPort() {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => port ? resolve(port) : reject(new Error("Failed to reserve local port")));
+    });
+  });
 }
 
 // ─── MCP Client — proxies a child MCP server ───────────────────────────────
@@ -286,6 +311,7 @@ class OpencodeHub {
     // Opencode backend
     this._openServerProc = null;
     this._openServerUrl = null;
+    this._openServerPid = null;
     this._openServerStarting = null;
     this._openServerExitCode = null;
     this._modelCache = { at: 0, text: "", models: [] };
@@ -301,70 +327,224 @@ class OpencodeHub {
     this._proxiedTools = [];
     this._toolBackend = {}; // exposed tool name -> { clientName, originalName }
     this._hubReady = false;
+
+    this._loadState();
   }
 
   // ── Backend: opencode serve ───────────────────────────────────────
 
+  _serializeJob(job) {
+    return {
+      id: job.id,
+      sid: job.sid,
+      agent: job.agent,
+      model: job.model,
+      prompt: job.prompt,
+      directory: job.directory,
+      createdAt: job.createdAt,
+      last: job.last || "",
+      lastMessageCount: job.lastMessageCount || 0,
+      submitDone: job.submitDone !== false,
+      submitStartedAt: job.submitStartedAt || null,
+      submitCompletedAt: job.submitCompletedAt || null,
+      lastProgressAt: job.lastProgressAt || job.createdAt,
+      progressSignature: job.progressSignature || "",
+      pollCount: job.pollCount || 0,
+      progress: job.progress || null,
+    };
+  }
+
+  _restoreJob(saved) {
+    if (!saved?.id || !saved?.sid) return null;
+    return {
+      id: saved.id,
+      sid: saved.sid,
+      agent: saved.agent || null,
+      model: saved.model || null,
+      prompt: saved.prompt || "",
+      directory: saved.directory || process.cwd(),
+      createdAt: saved.createdAt || Date.now(),
+      last: saved.last || "",
+      lastMessageCount: saved.lastMessageCount || 0,
+      submitDone: true,
+      submitError: null,
+      submitStartedAt: saved.submitStartedAt || saved.createdAt || Date.now(),
+      submitCompletedAt: saved.submitCompletedAt || null,
+      lastProgressAt: saved.lastProgressAt || saved.createdAt || Date.now(),
+      progressSignature: saved.progressSignature || "",
+      pollCount: saved.pollCount || 0,
+      progress: saved.progress || {
+        phase: "waiting_for_messages",
+        message_count: 0,
+        assistant_count: 0,
+        tool_part_count: 0,
+        latest_assistant_index: -1,
+        latest_assistant_complete: false,
+        latest_assistant_tool_call_turn: false,
+        latest_assistant_finish_reason: "",
+        latest_assistant_text_chars: 0,
+        last_poll_at: null,
+        last_progress_at: saved.lastProgressAt || saved.createdAt || Date.now(),
+        poll_count: saved.pollCount || 0,
+      },
+      restored: true,
+    };
+  }
+
+  _loadState() {
+    if (!PRESERVE_JOBS || !existsSync(STATE_FILE)) return;
+    try {
+      const raw = readFileSync(STATE_FILE, "utf-8");
+      const state = JSON.parse(raw);
+      if (state?.openServerUrl) this._openServerUrl = state.openServerUrl;
+      if (state?.openServerPid) this._openServerPid = state.openServerPid;
+      for (const saved of state?.jobs || []) {
+        const job = this._restoreJob(saved);
+        if (job) this._jobs.set(job.id, job);
+      }
+      const now = Date.now();
+      for (const completed of state?.completedJobs || []) {
+        if (!completed?.job_id || !completed?.text) continue;
+        if (completed.completedAt && now - completed.completedAt > COMPLETED_JOB_TTL) continue;
+        this._completedJobs.set(completed.job_id, completed);
+      }
+      this._pruneCompletedJobs({ save: false });
+      log(`Restored ${this._jobs.size} active opencode job(s) from ${STATE_FILE}`);
+    } catch (e) {
+      log(`Could not load durable job state: ${e.message}`);
+    }
+  }
+
+  _saveState() {
+    if (!PRESERVE_JOBS) return;
+    const jobs = [...this._jobs.values()].map(job => this._serializeJob(job));
+    const completedJobs = [...this._completedJobs.values()];
+    const openServerUrl = this._openServerUrl || null;
+    const openServerPid = this._openServerPid || this._openServerProc?.pid || null;
+
+    try {
+      if (!jobs.length && !completedJobs.length && !openServerUrl) {
+        if (existsSync(STATE_FILE)) unlinkSync(STATE_FILE);
+        return;
+      }
+      mkdirSync(STATE_DIR, { recursive: true });
+      const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({
+        version: VERSION,
+        savedAt: Date.now(),
+        openServerUrl,
+        openServerPid,
+        jobs,
+        completedJobs,
+      }, null, 2));
+      renameSync(tmp, STATE_FILE);
+    } catch (e) {
+      log(`Could not save durable job state: ${e.message}`);
+    }
+  }
+
+  _trackActiveJob(job) {
+    this._jobs.set(job.id, job);
+    this._saveState();
+  }
+
+  async _probeServer(url, timeoutMs = 1000) {
+    if (!url) return false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      await fetch(`${url}/__opencode_mcp_probe__`, {
+        method: "GET",
+        headers: { Authorization: AUTH },
+        signal: controller.signal,
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async _waitForServer(url, timeoutMs = 15000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (await this._probeServer(url, 1000)) return;
+      await sleep(100);
+    }
+    throw new Error("Opencode start timeout");
+  }
+
   async _ensureOpencode() {
-    if (this._openServerUrl) return;
+    if (this._openServerUrl) {
+      if (this._openServerProc || await this._probeServer(this._openServerUrl)) return;
+      log(`Persisted opencode server is not reachable: ${this._openServerUrl}`);
+      this._openServerUrl = null;
+      this._openServerPid = null;
+      this._openServerExitCode = null;
+      this._saveState();
+    }
     if (this._openServerStarting) return this._openServerStarting;
     if (!OPENCODE_BIN) {
       throw new Error("opencode binary not found. Install it with: curl -fsSL https://opencode.ai/install | sh");
     }
 
     log("Starting opencode serve...");
-    this._openServerStarting = new Promise((resolve, reject) => {
-      let settled = false;
-      const proc = spawn(OPENCODE_BIN, ["serve", "--port=0", "--hostname=127.0.0.1"], {
-        stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, FORCE_COLOR: "0" },
+    this._openServerStarting = (async () => {
+      const port = await pickPort();
+      const url = `http://127.0.0.1:${port}`;
+      const proc = spawn(OPENCODE_BIN, ["serve", `--port=${port}`, "--hostname=127.0.0.1"], {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, FORCE_COLOR: "0" },
       });
-      let out = "";
-      const fail = (err) => {
-        if (settled) return;
-        settled = true;
-        this._openServerStarting = null;
+      proc.unref();
+      this._openServerProc = proc;
+      this._openServerPid = proc.pid || null;
+      this._openServerUrl = url;
+      this._openServerExitCode = null;
+      this._saveState();
+
+      proc.on("exit", (code) => {
+        this._openServerExitCode = code;
+        this._openServerProc = null;
+        if (this._openServerPid === proc.pid) {
+          this._openServerPid = null;
+          this._openServerUrl = null;
+          this._saveState();
+        }
+      });
+
+      try {
+        await this._waitForServer(url, 15000);
+        log("Opencode ready:", this._openServerUrl);
+      } catch (err) {
         try {
           if (proc.exitCode == null) proc.kill();
         } catch {}
-        reject(err);
-      };
-      const onData = (chunk) => {
-        if (this._openServerUrl) return;
-        out += chunk.toString();
-        const m = out.match(/opencode server listening on (https?:\/\/[^\s]+)/);
-        if (m) {
-          settled = true;
-          this._openServerUrl = m[1];
-          this._openServerProc = proc;
-          this._openServerExitCode = null;
-          this._openServerStarting = null;
-          log("Opencode ready:", this._openServerUrl);
-          resolve();
-        }
-      };
-      proc.stdout.on("data", onData);
-      proc.stderr.on("data", onData);
-      proc.on("exit", (code) => {
-        if (!settled) {
-          fail(new Error(`Opencode exited before it was ready with code ${code}`));
-          return;
-        }
-        this._openServerExitCode = code;
         this._openServerProc = null;
+        this._openServerPid = null;
         this._openServerUrl = null;
-      });
-      proc.on("error", fail);
-      setTimeout(() => {
-        if (!settled) fail(new Error("Opencode start timeout"));
-      }, 15000);
-    });
+        this._saveState();
+        throw err;
+      } finally {
+        this._openServerStarting = null;
+      }
+    })();
     return this._openServerStarting;
   }
 
   _stopOpencode() {
-    if (this._openServerProc) { this._openServerProc.kill(); this._openServerProc = null; }
+    if (this._openServerProc) {
+      try { this._openServerProc.kill(); } catch {}
+      this._openServerProc = null;
+    } else if (this._openServerPid) {
+      try { process.kill(this._openServerPid); } catch {}
+    }
     this._openServerUrl = null;
+    this._openServerPid = null;
     this._openServerExitCode = null;
+    this._saveState();
   }
 
   async _api(method, path, body, queryParams, timeoutMs = API_TIMEOUT) {
@@ -374,15 +554,16 @@ class OpencodeHub {
       const qs = new URLSearchParams(queryParams).toString();
       if (qs) url += "?" + qs;
     }
-    const requestTimeout = Math.max(1, Number.parseInt(timeoutMs, 10) || API_TIMEOUT);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), requestTimeout);
+    const parsedTimeout = Number.parseInt(timeoutMs, 10);
+    const requestTimeout = Number.isFinite(parsedTimeout) ? parsedTimeout : API_TIMEOUT;
+    const controller = requestTimeout > 0 ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), requestTimeout) : null;
     try {
       const resp = await fetch(url, {
         method,
         headers: { "Content-Type": "application/json", Authorization: AUTH },
         body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
+        signal: controller?.signal,
       });
       const text = await resp.text().catch(() => "");
       if (!resp.ok) throw new Error(`API ${resp.status}: ${text.slice(0, 500)}`);
@@ -391,7 +572,7 @@ class OpencodeHub {
       if (e?.name === "AbortError") throw new Error(`API timeout after ${requestTimeout}ms: ${method} ${path}`);
       throw e;
     } finally {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -685,7 +866,7 @@ class OpencodeHub {
         `/session/${job.sid}/prompt_async`,
         msgBody,
         { directory: job.directory },
-        MESSAGE_TIMEOUT,
+        API_TIMEOUT,
       );
     const submitStreamingFallback = () =>
       this._api(
@@ -810,8 +991,8 @@ class OpencodeHub {
   }
 
   _progressPhase(job, latestAssistant, messageCount) {
-    if (!job.submitDone) return "submitting";
-    if (job.submitError) return "submit_error";
+    if (!job.submitDone && messageCount === 0) return "submitting";
+    if (job.submitError && messageCount === 0) return "submit_error";
     if (messageCount === 0) return "waiting_for_messages";
     if (!latestAssistant.hasLatestAssistant) return "waiting_for_assistant";
     if (latestAssistant.toolCallTurn) {
@@ -947,13 +1128,16 @@ class OpencodeHub {
     return result;
   }
 
-  _pruneCompletedJobs() {
+  _pruneCompletedJobs({ save = true } = {}) {
+    let changed = false;
     const now = Date.now();
     for (const [jobId, completed] of this._completedJobs.entries()) {
       if (now - completed.completedAt > COMPLETED_JOB_TTL) {
         this._completedJobs.delete(jobId);
+        changed = true;
       }
     }
+    if (changed && save) this._saveState();
   }
 
   _completeActiveJob(job, result) {
@@ -968,6 +1152,7 @@ class OpencodeHub {
       });
       this._pruneCompletedJobs();
     }
+    this._saveState();
   }
 
   async _createOpencodeJob(agent, model, prompt, directory, context = "cwd") {
@@ -1000,6 +1185,7 @@ class OpencodeHub {
       lastMessageCount: 0,
     };
     this._beginMessageSubmit(job, msgBody);
+    this._trackActiveJob(job);
     return job;
   }
 
@@ -1008,7 +1194,7 @@ class OpencodeHub {
     const waitBudget = this._clampedWaitMs(options.waitMs);
     const job = await this._createOpencodeJob(agent, model, prompt, directory, context);
     if (options.background) {
-      this._jobs.set(job.id, job);
+      this._trackActiveJob(job);
       return this._formatRunningJob(job, { elapsed: 0, last: "", reason: "background" });
     }
 
@@ -1021,7 +1207,7 @@ class OpencodeHub {
       return result.text;
     }
 
-    this._jobs.set(job.id, job);
+    this._trackActiveJob(job);
     return this._formatRunningJob(job, result);
   }
 
@@ -1036,13 +1222,14 @@ class OpencodeHub {
     let stable = 0;
     let last = job.last || "";
     let completionSignalSeen = false;
+    const remainingToolMs = () => TOOL_TIMEOUT > 0 ? TOOL_TIMEOUT - totalElapsed() : Number.POSITIVE_INFINITY;
     log(`Polling session ${sid} (max sync ${maxWaitMs}ms, max total ${TOOL_TIMEOUT}ms)...`);
 
     if (maxWaitMs <= 0) {
       return { status: "running", elapsed: totalElapsed(), last, reason: "no_wait" };
     }
 
-    while (Date.now() - start < maxWaitMs && totalElapsed() < TOOL_TIMEOUT) {
+    while (Date.now() - start < maxWaitMs && remainingToolMs() > 0) {
       if (job.submitError && !last) {
         try { await this._api("DELETE", `/session/${sid}`); } catch {}
         const result = {
@@ -1065,13 +1252,13 @@ class OpencodeHub {
         return result;
       }
 
-      const remainingBeforeSleep = Math.min(maxWaitMs - (Date.now() - start), TOOL_TIMEOUT - totalElapsed());
+      const remainingBeforeSleep = Math.min(maxWaitMs - (Date.now() - start), remainingToolMs());
       if (remainingBeforeSleep <= 0) break;
       await new Promise(r => setTimeout(r, Math.min(POLL_INTERVAL, remainingBeforeSleep)));
 
       let msgs;
       try {
-        const remainingForPoll = Math.min(maxWaitMs - (Date.now() - start), TOOL_TIMEOUT - totalElapsed());
+        const remainingForPoll = Math.min(maxWaitMs - (Date.now() - start), remainingToolMs());
         if (remainingForPoll <= 0) break;
         msgs = await this._api("GET", `/session/${sid}/message`, undefined, undefined, Math.min(API_TIMEOUT, remainingForPoll));
       } catch (e) {
@@ -1169,7 +1356,7 @@ class OpencodeHub {
       return { status: "complete", elapsed, last, text: last };
     }
 
-    if (elapsed >= TOOL_TIMEOUT) {
+    if (TOOL_TIMEOUT > 0 && elapsed >= TOOL_TIMEOUT) {
       try { await this._api("DELETE", `/session/${sid}`); } catch {}
       const text = last || `(no response after ${(elapsed / 1000).toFixed(0)}s)`;
       const result = { status: "timeout", elapsed, last, text: `Opencode job timed out after ${(elapsed / 1000).toFixed(0)}s.\n\n${text}` };
@@ -1187,6 +1374,7 @@ class OpencodeHub {
   }
 
   _formatRunningJob(job, result = {}) {
+    const suggestedWaitMs = RETURN_TIMEOUT > 0 ? Math.min(30_000, RETURN_TIMEOUT) : 0;
     const lines = [
       "Opencode job is still running.",
       `job_id: ${job.id}`,
@@ -1195,7 +1383,7 @@ class OpencodeHub {
       ...this._formatProgressNotes(job),
       "",
       "Poll with:",
-      JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: 30000 } }),
+      JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: suggestedWaitMs } }),
     ];
     if (!job.submitDone) {
       lines.splice(4, 0, "submit_status: pending");
@@ -1246,6 +1434,7 @@ class OpencodeHub {
     if (action === "cancel") {
       try { await this._api("DELETE", `/session/${job.sid}`); } catch {}
       this._jobs.delete(job.id);
+      this._saveState();
       return `Cancelled opencode job: ${job.id}`;
     }
 
@@ -1257,7 +1446,7 @@ class OpencodeHub {
     });
 
     if (result.status === "complete" || result.status === "timeout" || result.status === "stale_timeout") return result.text;
-    this._jobs.set(job.id, job);
+    this._trackActiveJob(job);
     return this._formatRunningJob(job, result);
   }
 
@@ -1514,18 +1703,29 @@ class OpencodeHub {
     }
   }
 
-  async _stopAll() {
-    this._stopOpencode();
+  async _stopAll({ cancelJobs = false } = {}) {
+    const preserveActiveJobs = PRESERVE_JOBS && !cancelJobs && this._jobs.size > 0;
+    if (preserveActiveJobs) {
+      log(`Preserving ${this._jobs.size} active opencode job(s) across bridge shutdown`);
+      this._openServerProc = null;
+      this._saveState();
+    } else {
+      this._stopOpencode();
+    }
+
     for (const c of this._mcpClients) c.stop();
     this._mcpClients = [];
     this._proxiedTools = [];
     this._toolBackend = {};
     this._modelAliasTools = [];
     this._modelToolBackend = {};
-    this._jobs.clear();
-    this._completedJobs.clear();
+    if (!preserveActiveJobs) {
+      this._jobs.clear();
+      this._completedJobs.clear();
+      this._saveState();
+    }
     this._mcpsStarted = null;
-    if (this._emptyContextDir) {
+    if (this._emptyContextDir && !preserveActiveJobs) {
       try { rmSync(this._emptyContextDir, { recursive: true, force: true }); } catch {}
       this._emptyContextDir = null;
     }
@@ -1576,7 +1776,7 @@ class OpencodeHub {
     process.stdin.on("error", () => process.exit(1));
   }
 
-  _exit() { this._stopAll(); setTimeout(() => process.exit(0), 100); }
+  _exit() { this._stopAll().finally(() => setTimeout(() => process.exit(0), 100)); }
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────────────
@@ -1587,7 +1787,7 @@ const activeMcps = mcpList.filter(n => !skipSet.has(n));
 console.error(`opencode-mcp v${VERSION} — MCP hub`);
 console.error(`  opencode:      ${OPENCODE_BIN || "(not found; install opencode for model calls)"}`);
 console.error(`  agents:        ${AGENTS.length} found`);
-console.error(`  tool timeout:  ${(TOOL_TIMEOUT / 1000).toFixed(0)}s`);
+console.error(`  tool timeout:  ${TOOL_TIMEOUT > 0 ? `${(TOOL_TIMEOUT / 1000).toFixed(0)}s` : "disabled"}`);
 console.error(`  proxy timeout: ${(PROXY_TIMEOUT / 1000).toFixed(0)}s`);
 console.error(`  proxied MCPs:  ${activeMcps.length > 0 ? activeMcps.join(", ") : "(none)"}`);
 console.error(`  debug:         ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);
@@ -1597,10 +1797,13 @@ const hub = new OpencodeHub();
 hub.start();
 
 // Clean shutdown on signals
-process.on("SIGTERM", () => { hub._stopAll(); process.exit(0); });
-process.on("SIGINT", () => { hub._stopAll(); process.exit(0); });
+function shutdownAndExit(code) {
+  hub._stopAll().finally(() => process.exit(code));
+}
+
+process.on("SIGTERM", () => shutdownAndExit(0));
+process.on("SIGINT", () => shutdownAndExit(0));
 process.on("uncaughtException", (err) => {
   console.error("[obridge] Uncaught:", err.message);
-  hub._stopAll();
-  process.exit(1);
+  shutdownAndExit(1);
 });

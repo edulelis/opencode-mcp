@@ -1,5 +1,21 @@
 # Changelog
 
+## 5.4.11 (2026-06-07)
+
+- **Durable active jobs**: Active opencode jobs are now persisted to disk with their session metadata and backend URL, so `opencode_job status` can recover them after the MCP bridge restarts.
+- **Preserve on bridge exit**: The bridge no longer kills its `opencode serve` backend when active jobs exist. Set `OPENCODE_MCP_PRESERVE_JOBS=0` to restore cleanup-on-exit behavior.
+- **Restart reattach**: `opencode serve` now starts on a known local port and is probed over HTTP, allowing the next bridge process to reattach to the same backend instead of losing in-memory job state.
+- **Config**: Added `OPENCODE_MCP_STATE_DIR` for durable job state location.
+- **Tests**: Added a bridge-restart regression proving a background job remains pollable and returns final output after the MCP process is killed and restarted.
+
+## 5.4.10 (2026-06-07)
+
+- **Codex-safe job handoff**: Lowered the default synchronous wait before returning a pollable job from 60s to 15s, so MCP clients have margin to receive the `job_id` before their own `tools/call` timeout.
+- **Long-run defaults**: Disabled the hard opencode job runtime cap by default (`OPENCODE_TOOL_TIMEOUT_MS=0`) so very long agent/model jobs keep running until completion or explicit cancellation.
+- **Stale jobs stay pollable**: Disabled automatic stale finalization by default (`OPENCODE_STALE_TIMEOUT_MS=0`) while keeping stale warnings and progress diagnostics. Set a positive stale timeout to restore auto-stop behavior.
+- **Fallback submit resilience**: The fast `/prompt_async` request now uses the regular API timeout, while the older blocking `/message` fallback can run without a submission timeout by default.
+- **Tests**: Added a long-idle job regression proving stale-warning jobs remain pollable and later deliver final output.
+
 ## 5.4.9 (2026-06-05)
 
 - **Auto stale timeout**: Jobs with no observed session progress are now stopped and finalized as `stale_timeout` diagnostics instead of requiring a manual cancel.

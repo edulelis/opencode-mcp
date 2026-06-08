@@ -147,6 +147,12 @@ const server = http.createServer(async (req, res) => {
       session.readyAt = Date.now();
       session.toolStepStalled = true;
     }
+    if (prompt.includes("long-idle-then-final")) {
+      session.response = "";
+      session.finalResponse = "FINAL_LONG_IDLE: completed after an idle wait";
+      session.readyAt = Date.now() + 10_000;
+      session.finalAt = Date.now() + 420;
+    }
     if (submitDelay && url.pathname.endsWith("/message")) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
@@ -219,7 +225,9 @@ const server = http.createServer(async (req, res) => {
   return send(res, 404, { error: "not found" });
 });
 
-server.listen(0, "127.0.0.1", () => {
+const portArg = process.argv.find(arg => arg.startsWith("--port="));
+const requestedPort = portArg ? Number.parseInt(portArg.slice("--port=".length), 10) : 0;
+server.listen(Number.isFinite(requestedPort) ? requestedPort : 0, "127.0.0.1", () => {
   const address = server.address();
   console.log("opencode server listening on http://127.0.0.1:" + address.port);
 });
@@ -693,7 +701,7 @@ async function run() {
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
-        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "tool-step-stalled please", wait_ms: 140 } } });
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "tool-step-stalled please", wait_ms: 350 } } });
         const started = await srv.waitForResponse(2);
         const startedText = started?.result?.content?.[0]?.text || "";
         const jobId = startedText.match(/job_id: (\S+)/)?.[1];
@@ -715,6 +723,11 @@ async function run() {
         assert(listedText.includes('"phase": "tool_call_complete_waiting_for_followup"'), "job list reports progress phase");
         assert(listedText.includes('"stale": true'), "job list marks stale jobs after threshold");
         assert(listedText.includes('"tool_part_count": 2'), "job list includes compact tool-call count");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "cancel", job_id: jobId } } });
+        const cancelled = await srv.waitForResponse(4);
+        const cancelledText = cancelled?.result?.content?.[0]?.text || "";
+        assert(cancelledText.includes(`Cancelled opencode job: ${jobId}`), "stalled tool-call job can be cancelled for cleanup");
       }, {
         OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
         OPENCODE_PROGRESS_STALE_MS: "80",
@@ -725,7 +738,90 @@ async function run() {
   }
 
   {
-    console.log("\n[14] auto-finalizes stale tool-call jobs with diagnostics");
+    console.log("\n[14] keeps long idle jobs pollable by default");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "long-idle-then-final please", background: true } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "long idle job starts as a running background job");
+        assert(!!jobId, "long idle job includes job_id");
+
+        await new Promise(r => setTimeout(r, 120));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 120 } } });
+        const running = await srv.waitForResponse(3);
+        const runningText = running?.result?.content?.[0]?.text || "";
+        assert(runningText.includes("Opencode job is still running."), "idle job remains pollable after stale warning threshold");
+        assert(runningText.includes("stale_warning: no session progress"), "idle job reports stale warning diagnostics");
+        assert(!runningText.includes("Opencode job marked stale and stopped."), "idle job is not auto-stopped by default");
+
+        await new Promise(r => setTimeout(r, 260));
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(4);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("FINAL_LONG_IDLE: completed after an idle wait"), "long idle job returns final output after later completion");
+      }, {
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+        OPENCODE_PROGRESS_STALE_MS: "40",
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[15] keeps active jobs pollable across bridge restart");
+    const fix = fixture();
+    try {
+      let srv1;
+      let srv2;
+      try {
+        srv1 = createServer(fix, {
+          OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+          OPENCODE_PROGRESS_STALE_MS: "40",
+        });
+        await srv1.waitForBanner();
+        await srv1.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } } });
+        await srv1.waitForResponse(1);
+        await srv1.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "long-idle-then-final please", background: true } } });
+        const started = await srv1.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "restart-survival job starts as running");
+        assert(!!jobId, "restart-survival job includes job_id");
+
+        srv1.cleanup();
+        await new Promise(r => setTimeout(r, 200));
+
+        srv2 = createServer(fix, {
+          OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+          OPENCODE_PROGRESS_STALE_MS: "40",
+        });
+        await srv2.waitForBanner();
+        await srv2.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } } });
+        await srv2.waitForResponse(3);
+
+        await new Promise(r => setTimeout(r, 300));
+        await srv2.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv2.waitForResponse(4);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("FINAL_LONG_IDLE: completed after an idle wait"), "job can be polled to completion after bridge restart");
+
+        await srv2.send({ jsonrpc: "2.0", id: 5, method: "shutdown", params: {} });
+        await srv2.waitForResponse(5);
+      } finally {
+        if (srv1) srv1.cleanup();
+        if (srv2) srv2.cleanup();
+      }
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[16] auto-finalizes stale tool-call jobs when configured");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
@@ -765,7 +861,7 @@ async function run() {
   }
 
   {
-    console.log("\n[15] shutdown");
+    console.log("\n[17] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
