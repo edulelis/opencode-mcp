@@ -233,9 +233,16 @@ if [ "$DOWNLOADED" = false ] || [ -z "$EXTRACTED_DIR" ] || [ ! -f "$EXTRACTED_DI
 fi
 
 BACKUP_DIR=""
+STATE_BACKUP=""
 ACTION="Installed"
 if [ -e "$INSTALL_DIR" ] || [ -L "$INSTALL_DIR" ]; then
   ACTION="Updated"
+  if [ -d "$INSTALL_DIR/state" ]; then
+    STATE_BACKUP="$TMP_DIR/state-preserve"
+    info "Preserving durable job state from $INSTALL_DIR/state"
+    mkdir -p "$STATE_BACKUP"
+    cp -R "$INSTALL_DIR/state"/. "$STATE_BACKUP"/
+  fi
   BACKUP_DIR="${INSTALL_DIR}.bak.$(date +%Y%m%d%H%M%S).$$"
   info "Backing up existing install to $BACKUP_DIR"
   mv "$INSTALL_DIR" "$BACKUP_DIR"
@@ -256,6 +263,12 @@ if [ "$COPY_STATUS" -ne 0 ]; then
     mv "$BACKUP_DIR" "$INSTALL_DIR"
   fi
   exit 1
+fi
+
+if [ -n "$STATE_BACKUP" ] && [ -d "$STATE_BACKUP" ]; then
+  mkdir -p "$INSTALL_DIR/state"
+  cp -R "$STATE_BACKUP"/. "$INSTALL_DIR/state"/
+  ok "Durable job state preserved"
 fi
 
 chmod +x "$INSTALL_DIR/src/index.mjs" 2>/dev/null || true

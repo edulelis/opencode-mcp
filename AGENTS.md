@@ -51,7 +51,7 @@ The `opencode` tool is handled directly by the hub (routes to opencode serve HTT
 | `src/index.mjs` | **Single-file hub** — entire MCP server in one file |
 | `tests/test.mjs` | Hermetic test suite with fake opencode and fake MCP fixtures |
 | `.github/workflows/test.yml` | CI on push (Node 24 LTS) |
-| `scripts/setup.sh` | One-command install from GitHub release |
+| `scripts/setup.sh` | One-command install from GitHub release; preserves durable `state/` across updates |
 
 ## Design Rules
 
@@ -63,3 +63,4 @@ The `opencode` tool is handled directly by the hub (routes to opencode serve HTT
 6. **Natural model routing** — clients such as Codex should be able to route prompts like "use DeepSeek" or "ask Gemini" from the dynamic `opencode_model_*` tools without hardcoded provider names
 7. **Durable long jobs** — active opencode jobs should not be killed by MCP call timeout or bridge restart; explicit `opencode_job cancel` remains the cleanup path
 8. **Reasoning is progress** — hidden reasoning streams must prevent false stale assumptions while keeping reasoning text private by default
+9. **Installer preserves state** — updates and forced reinstalls must not discard the durable job state directory

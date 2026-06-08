@@ -1,5 +1,10 @@
 # Changelog
 
+## 5.4.13 (2026-06-08)
+
+- **Installer state preservation**: `scripts/setup.sh` now preserves `~/.opencode-mcp/state` across updates and forced reinstalls, so durable active-job metadata is not stranded when upgrading the bridge.
+- **Docs**: Clarified that the installer keeps durable job state while replacing release files.
+
 ## 5.4.12 (2026-06-08)
 
 - **DeepSeek Reasoner progress**: Hidden `reasoning` parts now count as live session progress even when `OPENCODE_INCLUDE_REASONING` is off, avoiding false stale diagnostics while the model is still thinking after tool reads.
