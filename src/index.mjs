@@ -42,7 +42,7 @@ import { createServer } from "node:net";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.11";
+const VERSION = "5.4.12";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -856,6 +856,7 @@ class OpencodeHub {
       latest_assistant_tool_call_turn: false,
       latest_assistant_finish_reason: "",
       latest_assistant_text_chars: 0,
+      latest_assistant_reasoning_chars: 0,
       last_poll_at: null,
       last_progress_at: job.lastProgressAt,
       poll_count: 0,
@@ -956,6 +957,14 @@ class OpencodeHub {
     return typeof message?.content === "string" ? message.content : "";
   }
 
+  _reasoningTextChars(message) {
+    const parts = message?.parts;
+    if (!Array.isArray(parts)) return 0;
+    return parts
+      .filter((part) => part?.type === "reasoning" && part.text)
+      .reduce((count, part) => count + String(part.text || "").length, 0);
+  }
+
   _latestAssistantState(messages, prompt) {
     let latestAssistant = null;
     let latestAssistantIndex = -1;
@@ -974,6 +983,7 @@ class OpencodeHub {
         toolCallTurn: false,
         finishReason: "",
         toolPartCount: 0,
+        reasoningChars: 0,
         hasLatestAssistant: false,
       };
     }
@@ -986,6 +996,7 @@ class OpencodeHub {
       toolCallTurn: this._isToolCallTurn(latestAssistant),
       finishReason: this._messageFinishReason(latestAssistant),
       toolPartCount: this._countParts([latestAssistant], "tool"),
+      reasoningChars: this._reasoningTextChars(latestAssistant),
       hasLatestAssistant: true,
     };
   }
@@ -1002,6 +1013,7 @@ class OpencodeHub {
     }
     if (latestAssistant.text && latestAssistant.complete) return "final_text_complete";
     if (latestAssistant.text) return "receiving_text";
+    if (latestAssistant.reasoningChars) return "receiving_reasoning";
     return "waiting_for_assistant_text";
   }
 
@@ -1017,6 +1029,7 @@ class OpencodeHub {
       latest_assistant_tool_call_turn: !!latestAssistant.toolCallTurn,
       latest_assistant_finish_reason: latestAssistant.finishReason || "",
       latest_assistant_text_chars: latestAssistant.text?.length || 0,
+      latest_assistant_reasoning_chars: latestAssistant.reasoningChars || 0,
       last_poll_at: Date.now(),
       last_progress_at: job.lastProgressAt || job.createdAt || Date.now(),
       poll_count: job.pollCount || 0,
@@ -1035,6 +1048,7 @@ class OpencodeHub {
       snapshot.latest_assistant_tool_call_turn,
       snapshot.latest_assistant_finish_reason,
       snapshot.latest_assistant_text_chars,
+      snapshot.latest_assistant_reasoning_chars,
     ]);
     if (signature !== job.progressSignature) {
       job.lastProgressAt = now;
@@ -1085,6 +1099,7 @@ class OpencodeHub {
       `latest_assistant_tool_call_turn: ${!!progress.latest_assistant_tool_call_turn}`,
       `latest_assistant_finish_reason: ${progress.latest_assistant_finish_reason || ""}`,
       `latest_assistant_text_chars: ${progress.latest_assistant_text_chars || 0}`,
+      `latest_assistant_reasoning_chars: ${progress.latest_assistant_reasoning_chars || 0}`,
     ];
   }
 
@@ -1096,6 +1111,9 @@ class OpencodeHub {
     }
     if (progress.phase === "tool_call_complete_waiting_for_followup") {
       lines.push("progress_note: latest assistant turn completed with tool calls; waiting for follow-up assistant text.");
+    }
+    if (progress.phase === "receiving_reasoning") {
+      lines.push("progress_note: latest assistant is streaming reasoning; final visible text may arrive later.");
     }
     if (lastActivityAge >= PROGRESS_STALE_MS) {
       lines.push(`stale_warning: no session progress for ${lastActivityAge}ms`);

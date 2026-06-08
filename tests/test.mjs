@@ -153,6 +153,14 @@ const server = http.createServer(async (req, res) => {
       session.readyAt = Date.now() + 10_000;
       session.finalAt = Date.now() + 420;
     }
+    if (prompt.includes("reasoning-then-final")) {
+      session.response = "";
+      session.finalResponse = "FINAL_REASONING: visible final after hidden reasoning";
+      session.readyAt = Date.now();
+      session.reasoningPolls = 0;
+      session.finalAfterReasoningPolls = 14;
+      session.reasoningThenFinal = true;
+    }
     if (submitDelay && url.pathname.endsWith("/message")) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
@@ -195,12 +203,21 @@ const server = http.createServer(async (req, res) => {
 
     let assistantText = "";
     let completed = false;
+    let reasoningText = "";
+    if (session.reasoningThenFinal) {
+      session.reasoningPolls = (session.reasoningPolls || 0) + 1;
+    }
     if (session.finalResponse) {
-      if (now >= session.finalAt) {
+      const reasoningFinalReady = session.reasoningThenFinal && session.reasoningPolls >= session.finalAfterReasoningPolls;
+      if (reasoningFinalReady || (!session.reasoningThenFinal && now >= session.finalAt)) {
         assistantText = session.finalResponse;
         completed = true;
       } else if (now >= session.readyAt) {
         assistantText = session.response || "";
+        if (session.reasoningThenFinal) {
+          const ticks = Math.max(1, session.reasoningPolls || 1);
+          reasoningText = "thinking ".repeat(ticks).trim();
+        }
       }
     } else if (now >= session.readyAt) {
       assistantText = session.response || "";
@@ -208,9 +225,10 @@ const server = http.createServer(async (req, res) => {
     }
     const assistantInfo = { role: "assistant", time: { created: session.createdAt } };
     if (completed) assistantInfo.time.completed = now;
-    const assistantParts = assistantText
-      ? [{ type: "text", text: assistantText }]
-      : [];
+    const assistantParts = [
+      ...(reasoningText ? [{ type: "reasoning", text: reasoningText }] : []),
+      ...(assistantText ? [{ type: "text", text: assistantText }] : []),
+    ];
     return send(res, 200, [
       { info: { role: "user" }, parts: [{ type: "text", text: session.prompt || "" }] },
       { info: assistantInfo, parts: assistantParts }
@@ -772,7 +790,45 @@ async function run() {
   }
 
   {
-    console.log("\n[15] keeps active jobs pollable across bridge restart");
+    console.log("\n[15] tracks reasoning-stream progress before final text");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "reasoner", prompt: "reasoning-then-final please", wait_ms: 60 } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "reasoning-only response starts as running");
+        assert(!!jobId, "reasoning-only response includes job_id");
+
+        await new Promise(r => setTimeout(r, 140));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 120 } } });
+        const reasoning = await srv.waitForResponse(3);
+        const reasoningText = reasoning?.result?.content?.[0]?.text || "";
+        assert(reasoningText.includes("Opencode job is still running."), "reasoning-only response remains pollable");
+        assert(reasoningText.includes("phase: receiving_reasoning"), "reasoning-only progress reports receiving_reasoning phase");
+        assert(reasoningText.match(/latest_assistant_reasoning_chars: [1-9][0-9]*/), "reasoning-only progress reports reasoning character count");
+        assert(reasoningText.includes("progress_note: latest assistant is streaming reasoning"), "reasoning-only progress explains hidden reasoning state");
+        assert(!reasoningText.includes("stale_warning"), "reasoning character growth prevents false stale warning");
+        assert(!reasoningText.includes("thinking thinking"), "reasoning text is not exposed when OPENCODE_INCLUDE_REASONING is off");
+
+        await new Promise(r => setTimeout(r, 240));
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 500 } } });
+        const completed = await srv.waitForResponse(4);
+        const completedText = completed?.result?.content?.[0]?.text || "";
+        assert(completedText.includes("FINAL_REASONING: visible final after hidden reasoning"), "reasoning-only job returns final visible text");
+      }, {
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+        OPENCODE_PROGRESS_STALE_MS: "80",
+        OPENCODE_INCLUDE_REASONING: "",
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[16] keeps active jobs pollable across bridge restart");
     const fix = fixture();
     try {
       let srv1;
@@ -821,7 +877,7 @@ async function run() {
   }
 
   {
-    console.log("\n[16] auto-finalizes stale tool-call jobs when configured");
+    console.log("\n[17] auto-finalizes stale tool-call jobs when configured");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {
@@ -861,7 +917,7 @@ async function run() {
   }
 
   {
-    console.log("\n[17] shutdown");
+    console.log("\n[18] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

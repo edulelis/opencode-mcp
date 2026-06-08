@@ -40,7 +40,7 @@ Run the same command again to update. Existing installs are version-checked, bac
 
 ```bash
 # Download the release zip
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.11/opencode-mcp-v5.4.11.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.12/opencode-mcp-v5.4.12.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 mv ~/opencode-mcp ~/.opencode-mcp
@@ -52,7 +52,7 @@ The entire MCP server is one self-contained file:
 
 ```bash
 mkdir -p ~/.opencode-mcp/src
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.11/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.12/src/index.mjs \
   -o ~/.opencode-mcp/src/index.mjs
 ```
 
@@ -158,6 +158,8 @@ Poll it with:
 
 Use `{"action":"list"}` to see active and recently completed jobs, and `{"action":"cancel","job_id":"s1"}` to stop one explicitly. Active jobs are persisted under `~/.opencode-mcp/state` by default, and the bridge preserves the opencode backend when it exits with active jobs, so a restarted MCP bridge can continue polling the same job while the machine and opencode process stay alive.
 
+DeepSeek Reasoner and similar models may stream hidden reasoning for a while after tool reads. When that happens, status polls show `phase: receiving_reasoning` and `latest_assistant_reasoning_chars` instead of visible answer text. That character count is treated as live progress, but the reasoning text itself is not returned unless you opt in with `OPENCODE_INCLUDE_REASONING=1`.
+
 ## Environment Configuration
 
 The bridge auto-detects most things, but you can override:
@@ -220,6 +222,16 @@ node src/index.mjs
 ```
 
 Set `OPENCODE_STALE_TIMEOUT_MS` only if you explicitly want stale jobs to auto-stop.
+
+### DeepSeek finished tool reads but has no final text yet
+
+Poll the job instead of cancelling it immediately:
+
+```json
+{ "action": "status", "job_id": "s1", "wait_ms": 30000 }
+```
+
+If the status shows `phase: receiving_reasoning`, the model is still active and the bridge is intentionally waiting for visible final text. The reasoning character count should grow across polls while DeepSeek is thinking.
 
 ### "API 401" error
 

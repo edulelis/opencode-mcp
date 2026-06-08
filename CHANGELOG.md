@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.4.12 (2026-06-08)
+
+- **DeepSeek Reasoner progress**: Hidden `reasoning` parts now count as live session progress even when `OPENCODE_INCLUDE_REASONING` is off, avoiding false stale diagnostics while the model is still thinking after tool reads.
+- **Reasoning diagnostics**: Running job status reports `phase: receiving_reasoning` plus `latest_assistant_reasoning_chars` without exposing the reasoning text by default.
+- **Tests**: Added a deterministic regression where a reasoner streams hidden reasoning for multiple polls before final visible text, proving the job remains pollable and later returns the final answer.
+
 ## 5.4.11 (2026-06-07)
 
 - **Durable active jobs**: Active opencode jobs are now persisted to disk with their session metadata and backend URL, so `opencode_job status` can recover them after the MCP bridge restarts.

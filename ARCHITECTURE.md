@@ -68,6 +68,7 @@ Hub → Client:  {"result":{"content":[...]}}
 - When active jobs exist, bridge shutdown preserves the opencode server so a restarted bridge can reattach and poll them
 - Communicates via HTTP with Basic Auth
 - Used by the `opencode` tool for agents and model calls
+- Running job progress tracks message counts, tool parts, visible assistant text, and hidden reasoning character counts. Hidden reasoning growth is treated as live progress and reported as `phase: receiving_reasoning` without returning reasoning text by default.
 - Dynamic shortcut tools are generated from `opencode models` as `opencode_model_<provider-or-family>` by default.
 - Shortcut tools default to an empty temporary working directory (`context: "none"`) so provider-only requests do not inherit the current repository context.
 

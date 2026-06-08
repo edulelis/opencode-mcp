@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.11/opencode-mcp-v5.4.11.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.12/opencode-mcp-v5.4.12.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.11/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.12/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -186,6 +186,16 @@ You can also start a call in the background immediately:
 
 Use `{"action":"list"}` to list running jobs and recently completed jobs, `{"action":"cancel","job_id":"s1"}` to cancel one, and repeat `status` polls to read cached completed output for a short time after completion. Active jobs are persisted to disk and the bridge preserves the opencode server when it exits, so a job can be polled after the MCP bridge restarts as long as the machine and opencode server process stayed alive. Jobs that stop making session progress stay pollable by default and report stale-warning diagnostics with their latest partial output. Set `OPENCODE_STALE_TIMEOUT_MS` to a positive value if you want stale jobs to be stopped automatically.
 
+Reasoning models such as DeepSeek Reasoner can spend a long time streaming hidden reasoning after tool reads before emitting visible final text. Status polls report that as live progress:
+
+```text
+phase: receiving_reasoning
+latest_assistant_reasoning_chars: 2048
+progress_note: latest assistant is streaming reasoning; final visible text may arrive later.
+```
+
+The bridge counts reasoning character growth as progress, so stale warnings are based on real session liveness. Reasoning text itself stays hidden unless `OPENCODE_INCLUDE_REASONING=1` is set.
+
 ### 5. List resources
 
 ```json
@@ -245,7 +255,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |
-| `OPENCODE_INCLUDE_REASONING` | off | Set `1` to include reasoning parts in returned text |
+| `OPENCODE_INCLUDE_REASONING` | off | Set `1` to include reasoning parts in returned text; reasoning character counts are still tracked for progress when off |
 | `OPENCODE_ALIAS_TOOLS` | `providers` | `providers` generates provider/family shortcuts, `models` generates one per model, `off` disables shortcuts |
 | `DEBUG` | off | Set `DEBUG=1` for verbose logs |
 
