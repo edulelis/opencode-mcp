@@ -161,6 +161,10 @@ const server = http.createServer(async (req, res) => {
       session.finalAfterReasoningPolls = 14;
       session.reasoningThenFinal = true;
     }
+    if (prompt.includes("vanish-session")) {
+      session.readyAt = Date.now();
+      session.vanishOnPoll = true;
+    }
     if (submitDelay && url.pathname.endsWith("/message")) {
       setTimeout(() => send(res, 200, { id: "m1" }), submitDelay);
       return;
@@ -170,6 +174,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname.endsWith("/message")) {
     const now = Date.now();
+    if (session.vanishOnPoll) {
+      sessions.delete(sid);
+      return send(res, 404, { error: "missing session" });
+    }
     if (session.toolStepFinal || session.toolStepStalled) {
       const finalComplete = now >= session.finalAt;
       const firstAssistantInfo = { role: "assistant", finish: "tool-calls", time: { created: session.createdAt + 1, completed: session.createdAt + 2 } };
@@ -917,7 +925,42 @@ async function run() {
   }
 
   {
-    console.log("\n[18] shutdown");
+    console.log("\n[18] cleans up jobs when backend sessions disappear");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "vanish-session please", background: true } } });
+        const started = await srv.waitForResponse(2);
+        const startedText = started?.result?.content?.[0]?.text || "";
+        const jobId = startedText.match(/job_id: (\S+)/)?.[1];
+        assert(startedText.includes("Opencode job is still running."), "disappearing session starts as a running background job");
+        assert(!!jobId, "disappearing session includes job_id");
+
+        await new Promise(r => setTimeout(r, 60));
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 300 } } });
+        const missing = await srv.waitForResponse(3);
+        const missingText = missing?.result?.content?.[0]?.text || "";
+        assert(missingText.includes("Opencode session is no longer available."), "missing backend session returns a terminal diagnostic");
+        assert(missingText.includes("status: missing_session"), "missing backend session reports missing_session status");
+        assert(missingText.includes("last_poll_error: API 404"), "missing backend session keeps the poll error detail");
+
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: jobId, wait_ms: 50 } } });
+        const cached = await srv.waitForResponse(4);
+        const cachedText = cached?.result?.content?.[0]?.text || "";
+        assert(cachedText.includes("status: missing_session"), "missing session diagnostic is cached for repeat polls");
+
+        await srv.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "opencode_job", arguments: { action: "list" } } });
+        const listed = await srv.waitForResponse(5);
+        const listedText = listed?.result?.content?.[0]?.text || "";
+        assert(listedText.includes('"jobs": []'), "missing backend session is removed from active jobs");
+      }, { OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000" });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[19] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

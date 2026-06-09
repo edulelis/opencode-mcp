@@ -576,6 +576,16 @@ class OpencodeHub {
     }
   }
 
+  _apiErrorStatus(error) {
+    const match = String(error?.message || "").match(/^API\s+(\d+):/);
+    return match ? Number.parseInt(match[1], 10) : null;
+  }
+
+  _isApiStatus(error, statuses) {
+    const status = this._apiErrorStatus(error);
+    return Number.isFinite(status) && statuses.includes(status);
+  }
+
   _parseModel(modelStr) {
     if (!modelStr) return undefined;
     const idx = modelStr.indexOf("/");
@@ -879,7 +889,7 @@ class OpencodeHub {
       );
     job.submitPromise = submitAsync()
       .catch((error) => {
-        if (String(error?.message || "").match(/API (404|405):/)) {
+        if (this._isApiStatus(error, [404, 405])) {
           return submitStreamingFallback();
         }
         throw error;
@@ -1138,12 +1148,44 @@ class OpencodeHub {
     return lines.join("\n");
   }
 
+  _formatMissingSessionJob(job, elapsed, last) {
+    const lines = [
+      "Opencode session is no longer available.",
+      `job_id: ${job.id}`,
+      "status: missing_session",
+      ...this._formatProgressLines(job, { elapsed }),
+      ...this._formatProgressNotes(job),
+    ];
+    if (last) {
+      lines.push("", "Latest partial output:", last.slice(0, 4000));
+    }
+    return lines.join("\n");
+  }
+
   async _completeStaleJob(job, sid, elapsed, last) {
     try { await this._api("DELETE", `/session/${sid}`); } catch {}
     const text = this._formatStaleJobTimeout(job, elapsed, last);
     const result = { status: "stale_timeout", elapsed, last, text };
     this._completeActiveJob(job, result);
     return result;
+  }
+
+  async _completeMissingSessionJob(job, elapsed, last, error) {
+    job.lastPollError = error?.message || "session missing";
+    job.lastPollErrorAt = Date.now();
+    this._updateJobProgress(job, {
+      ...(job.progress || {}),
+      phase: "missing_session",
+      last_poll_at: Date.now(),
+    });
+    const text = this._formatMissingSessionJob(job, elapsed, last);
+    const result = { status: "missing_session", elapsed, last, text };
+    this._completeActiveJob(job, result);
+    return result;
+  }
+
+  _isTerminalJobResult(result) {
+    return ["complete", "timeout", "stale_timeout", "missing_session"].includes(result?.status);
   }
 
   _pruneCompletedJobs({ save = true } = {}) {
@@ -1221,7 +1263,7 @@ class OpencodeHub {
       deleteOnComplete: true,
     });
 
-    if (result.status === "complete" || result.status === "timeout" || result.status === "stale_timeout") {
+    if (this._isTerminalJobResult(result)) {
       return result.text;
     }
 
@@ -1281,6 +1323,9 @@ class OpencodeHub {
         msgs = await this._api("GET", `/session/${sid}/message`, undefined, undefined, Math.min(API_TIMEOUT, remainingForPoll));
       } catch (e) {
         log(`Poll error: ${e.message}`);
+        if (this._isApiStatus(e, [404, 410])) {
+          return await this._completeMissingSessionJob(job, totalElapsed(), last, e);
+        }
         job.lastPollError = e.message;
         job.lastPollErrorAt = Date.now();
         this._updateJobProgress(job, {
@@ -1463,7 +1508,7 @@ class OpencodeHub {
       deleteOnComplete: true,
     });
 
-    if (result.status === "complete" || result.status === "timeout" || result.status === "stale_timeout") return result.text;
+    if (this._isTerminalJobResult(result)) return result.text;
     this._trackActiveJob(job);
     return this._formatRunningJob(job, result);
   }
