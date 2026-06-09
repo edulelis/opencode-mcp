@@ -40,7 +40,7 @@ Run the same command again to update. Existing installs are version-checked, dur
 
 ```bash
 # Download the release zip
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.13/opencode-mcp-v5.4.13.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.14/opencode-mcp-v5.4.14.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 mv ~/opencode-mcp ~/.opencode-mcp
@@ -52,7 +52,7 @@ The entire MCP server is one self-contained file:
 
 ```bash
 mkdir -p ~/.opencode-mcp/src
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.13/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.14/src/index.mjs \
   -o ~/.opencode-mcp/src/index.mjs
 ```
 

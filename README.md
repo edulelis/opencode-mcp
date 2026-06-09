@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.13/opencode-mcp-v5.4.13.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.14/opencode-mcp-v5.4.14.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.13/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.14/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 

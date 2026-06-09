@@ -1,5 +1,10 @@
 # Changelog
 
+## 5.4.14 (2026-06-09)
+
+- **Missing session cleanup**: `opencode_job status` now treats backend `404/410` message polls as terminal `missing_session` results, removes the job from the active list, and caches the diagnostic instead of leaving durable job state orphaned.
+- **Tests**: Added a regression where the fake opencode backend deletes a session before the next message poll, proving the bridge cleans it up and repeat polls return the cached diagnostic.
+
 ## 5.4.13 (2026-06-08)
 
 - **Installer state preservation**: `scripts/setup.sh` now preserves `~/.opencode-mcp/state` across updates and forced reinstalls, so durable active-job metadata is not stranded when upgrading the bridge.
