@@ -15,7 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/main/s
 ```
 
 This downloads the [latest release](https://github.com/edulelis/opencode-mcp/releases/latest), extracts it to `~/.opencode-mcp`, and prints registration instructions.
-Run the same command again to update an existing install. The installer checks the current version, skips cleanly when already current, preserves durable job state, and uses a timestamped backup before replacing files. Use `--force` or `OPENCODE_MCP_FORCE=1` to reinstall the same version.
+Run the same command again to update an existing install. The installer checks the current version, skips cleanly when already current, preserves durable job state, and uses a timestamped backup before replacing files. If Codex is configured to run a copied bridge under `~/.codex/mcp-servers/`, the installer also refreshes that copy automatically. Use `--force` or `OPENCODE_MCP_FORCE=1` to reinstall the same version.
 
 ### Manual (just the server file)
 
@@ -23,7 +23,7 @@ If you only want the server file (zero dependencies, single file):
 
 ```bash
 mkdir -p ~/opencode-mcp
-curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.14/opencode-mcp-v5.4.14.zip \
+curl -fsSL https://github.com/edulelis/opencode-mcp/releases/download/v5.4.15/opencode-mcp-v5.4.15.zip \
   -o /tmp/opencode-mcp.zip
 unzip /tmp/opencode-mcp.zip -d ~/
 ```
@@ -31,7 +31,7 @@ unzip /tmp/opencode-mcp.zip -d ~/
 Or grab just the server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.14/src/index.mjs \
+curl -fsSL https://raw.githubusercontent.com/edulelis/opencode-mcp/v5.4.15/src/index.mjs \
   -o ~/opencode-mcp/index.mjs
 ```
 
@@ -196,6 +196,14 @@ progress_note: latest assistant is streaming reasoning; final visible text may a
 
 The bridge counts reasoning character growth as progress, so stale warnings are based on real session liveness. Reasoning text itself stays hidden unless `OPENCODE_INCLUDE_REASONING=1` is set.
 
+Some providers/accounts tolerate fewer parallel model jobs than MCP clients can launch. opencode exposes model metadata such as context/output limits, but not account-specific concurrency caps, so the bridge can queue jobs locally when configured:
+
+```bash
+OPENCODE_MODEL_CONCURRENCY="deepseek=1,anthropic=2,default=4"
+```
+
+Keys may be provider IDs such as `deepseek`, full model IDs such as `google/gemini-2.5-pro`, or `default`. Queued jobs return a normal `job_id` with `phase: queued` and start automatically when an active job for that key finishes or is cancelled.
+
 ### 5. List resources
 
 ```json
@@ -255,6 +263,7 @@ The bridge speaks standard MCP over stdio. Works with any client that supports t
 | `OPENCODE_PROXY_TIMEOUT_MS` | `300000` | Max wait for proxied child MCP tools |
 | `OPENCODE_MODEL_CACHE_MS` | `60000` | Cache duration for `opencode models` discovery |
 | `OPENCODE_POLL_INTERVAL_MS` | `2000` | Poll interval for opencode sessions |
+| `OPENCODE_MODEL_CONCURRENCY` | unlimited | Optional provider/model job caps, e.g. `deepseek=1,anthropic=2,default=4`; queued jobs stay pollable until a slot opens |
 | `OPENCODE_INCLUDE_REASONING` | off | Set `1` to include reasoning parts in returned text; reasoning character counts are still tracked for progress when off |
 | `OPENCODE_ALIAS_TOOLS` | `providers` | `providers` generates provider/family shortcuts, `models` generates one per model, `off` disables shortcuts |
 | `DEBUG` | off | Set `DEBUG=1` for verbose logs |

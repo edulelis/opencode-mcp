@@ -960,7 +960,49 @@ async function run() {
   }
 
   {
-    console.log("\n[19] shutdown");
+    console.log("\n[19] queues model jobs when provider concurrency is capped");
+    const fix = fixture();
+    try {
+      await withServer(fix, async (srv) => {
+        await srv.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "partial-then-final first", background: true } } });
+        const first = await srv.waitForResponse(2);
+        const firstText = first?.result?.content?.[0]?.text || "";
+        const firstJobId = firstText.match(/job_id: (\S+)/)?.[1];
+        assert(firstText.includes("Opencode job is still running."), "first capped provider job starts");
+        assert(!!firstJobId, "first capped provider job includes job_id");
+        assert(firstText.includes("concurrency_key: deepseek"), "first job reports provider concurrency key");
+
+        await srv.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "opencode_model_deepseek", arguments: { model: "chat", prompt: "second capped job", background: true } } });
+        const second = await srv.waitForResponse(3);
+        const secondText = second?.result?.content?.[0]?.text || "";
+        const secondJobId = secondText.match(/job_id: (\S+)/)?.[1];
+        assert(secondText.includes("submit_status: queued"), "second capped provider job is queued instead of submitted");
+        assert(secondText.includes("phase: queued"), "queued provider job reports queued phase");
+        assert(secondText.includes("concurrency_limit: 1"), "queued provider job reports concurrency limit");
+        assert(secondText.includes("queue_position: 1"), "queued provider job reports queue position");
+        assert(!!secondJobId, "queued provider job includes job_id");
+
+        await new Promise(r => setTimeout(r, 380));
+        await srv.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: firstJobId, wait_ms: 500 } } });
+        const completedFirst = await srv.waitForResponse(4);
+        const completedFirstText = completedFirst?.result?.content?.[0]?.text || "";
+        assert(completedFirstText.includes("FINAL: model=deepseek/deepseek-chat complete"), "first capped provider job completes");
+
+        await srv.send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "opencode_job", arguments: { action: "status", job_id: secondJobId, wait_ms: 500 } } });
+        const completedSecond = await srv.waitForResponse(5);
+        const completedSecondText = completedSecond?.result?.content?.[0]?.text || "";
+        assert(completedSecondText.includes("model=deepseek/deepseek-chat"), "queued provider job starts after slot is released");
+      }, {
+        OPENCODE_MCP_RETURN_TIMEOUT_MS: "1000",
+        OPENCODE_MODEL_CONCURRENCY: "deepseek=1",
+      });
+    } finally {
+      fix.cleanup();
+    }
+  }
+
+  {
+    console.log("\n[20] shutdown");
     const fix = fixture();
     try {
       await withServer(fix, async (srv) => {

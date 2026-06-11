@@ -27,6 +27,7 @@
  *   OPENCODE_STALE_TIMEOUT_MS fail and clean up stale jobs after no progress; 0 disables (default: 0)
  *   OPENCODE_PROXY_TIMEOUT_MS max wait for proxied MCP tools (default: 300000)
  *   OPENCODE_POLL_INTERVAL_MS session polling interval       (default: 2000)
+ *   OPENCODE_MODEL_CONCURRENCY provider/model job caps, e.g. deepseek=1,anthropic=2,default=4
  *   OPENCODE_INCLUDE_REASONING include reasoning parts        (default: off)
  *   OPENCODE_ALIAS_TOOLS     off|providers|models            (default: providers)
  *   DEBUG                     set "1" for verbose logs
@@ -42,7 +43,7 @@ import { createServer } from "node:net";
 // ─── Config ────────────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_DEBUG = !!process.env.DEBUG;
-const VERSION = "5.4.14";
+const VERSION = "5.4.15";
 const log = IS_DEBUG ? (...args) => console.error("[obridge]", ...args) : () => {};
 
 function findOpencode() {
@@ -114,6 +115,7 @@ const MODEL_CACHE_MS = envMs("OPENCODE_MODEL_CACHE_MS", 60_000);
 const POLL_INTERVAL = envMs("OPENCODE_POLL_INTERVAL_MS", 2_000);
 const INCLUDE_REASONING = process.env.OPENCODE_INCLUDE_REASONING === "1";
 const ALIAS_TOOLS = normalizeName(process.env.OPENCODE_ALIAS_TOOLS || "providers");
+const MODEL_CONCURRENCY = parseConcurrencyLimits(process.env.OPENCODE_MODEL_CONCURRENCY || "");
 
 const AGENTS = CFG.agent
   ? Object.entries(CFG.agent).map(([n, d]) => ({ name: n, description: (d.description || n).split("\n")[0].slice(0, 120), model: d.model || "default" }))
@@ -130,6 +132,27 @@ function sanitizeToolName(value) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseConcurrencyLimits(raw) {
+  const limits = new Map();
+  const text = String(raw || "").trim();
+  if (!text || ["0", "off", "false", "none", "unlimited"].includes(normalizeName(text))) return limits;
+
+  for (const part of text.split(/[,\s;]+/).map(s => s.trim()).filter(Boolean)) {
+    let key = "default";
+    let value = part;
+    const match = part.match(/^([^:=]+)[:=](\d+)$/);
+    if (match) {
+      key = match[1];
+      value = match[2];
+    }
+    const limit = Number.parseInt(value, 10);
+    if (!Number.isFinite(limit) || limit <= 0) continue;
+    const normalizedKey = normalizeName(key);
+    limits.set(normalizedKey === "*" ? "default" : normalizedKey, limit);
+  }
+  return limits;
 }
 
 function pickPort() {
@@ -321,6 +344,7 @@ class OpencodeHub {
     this._emptyContextDir = null;
     this._jobs = new Map();
     this._completedJobs = new Map();
+    this._queueDrainTimer = null;
 
     // Proxied MCP backends
     this._mcpClients = []; // MCPClient[]
@@ -351,30 +375,48 @@ class OpencodeHub {
       progressSignature: job.progressSignature || "",
       pollCount: job.pollCount || 0,
       progress: job.progress || null,
+      resolvedModel: job.resolvedModel || null,
+      submitQueued: !!job.submitQueued,
+      queuedAt: job.queuedAt || null,
+      startedAt: job.startedAt || null,
+      throttleKey: job.throttleKey || null,
+      throttleLimit: job.throttleLimit || null,
+      slotAcquired: !!job.slotAcquired,
+      pendingMsgBody: job.submitQueued ? (job.pendingMsgBody || null) : null,
     };
   }
 
   _restoreJob(saved) {
     if (!saved?.id || !saved?.sid) return null;
+    const submitQueued = !!saved.submitQueued;
+    const now = Date.now();
     return {
       id: saved.id,
       sid: saved.sid,
       agent: saved.agent || null,
       model: saved.model || null,
+      resolvedModel: saved.resolvedModel || null,
       prompt: saved.prompt || "",
       directory: saved.directory || process.cwd(),
-      createdAt: saved.createdAt || Date.now(),
+      createdAt: saved.createdAt || now,
       last: saved.last || "",
       lastMessageCount: saved.lastMessageCount || 0,
-      submitDone: true,
+      submitDone: submitQueued ? false : true,
+      submitQueued,
       submitError: null,
-      submitStartedAt: saved.submitStartedAt || saved.createdAt || Date.now(),
+      submitStartedAt: saved.submitStartedAt || saved.createdAt || now,
       submitCompletedAt: saved.submitCompletedAt || null,
-      lastProgressAt: saved.lastProgressAt || saved.createdAt || Date.now(),
+      queuedAt: saved.queuedAt || (submitQueued ? saved.createdAt : null) || null,
+      startedAt: saved.startedAt || null,
+      throttleKey: saved.throttleKey || null,
+      throttleLimit: saved.throttleLimit || null,
+      slotAcquired: submitQueued ? false : !!saved.slotAcquired,
+      pendingMsgBody: submitQueued ? saved.pendingMsgBody || this._buildMessageBody(saved.agent || null, saved.resolvedModel || saved.model || null, saved.prompt || "") : null,
+      lastProgressAt: saved.lastProgressAt || saved.createdAt || now,
       progressSignature: saved.progressSignature || "",
       pollCount: saved.pollCount || 0,
       progress: saved.progress || {
-        phase: "waiting_for_messages",
+        phase: submitQueued ? "queued" : "waiting_for_messages",
         message_count: 0,
         assistant_count: 0,
         tool_part_count: 0,
@@ -383,8 +425,9 @@ class OpencodeHub {
         latest_assistant_tool_call_turn: false,
         latest_assistant_finish_reason: "",
         latest_assistant_text_chars: 0,
+        latest_assistant_reasoning_chars: 0,
         last_poll_at: null,
-        last_progress_at: saved.lastProgressAt || saved.createdAt || Date.now(),
+        last_progress_at: saved.lastProgressAt || saved.createdAt || now,
         poll_count: saved.pollCount || 0,
       },
       restored: true,
@@ -593,6 +636,15 @@ class OpencodeHub {
     return { providerID: modelStr.slice(0, idx), modelID: modelStr.slice(idx + 1) };
   }
 
+  _buildMessageBody(agent, resolvedModel, prompt) {
+    const msgBody = {
+      parts: [{ type: "text", text: prompt }],
+    };
+    if (agent) msgBody.agent = agent;
+    if (resolvedModel) msgBody.model = this._parseModel(resolvedModel);
+    return msgBody;
+  }
+
   _modelsText() {
     if (!OPENCODE_BIN) {
       throw new Error("opencode binary not found. Install it with: curl -fsSL https://opencode.ai/install | sh");
@@ -611,6 +663,129 @@ class OpencodeHub {
 
   _modelProvider(model) {
     return String(model || "").split("/")[0] || "";
+  }
+
+  _agentModel(agentName) {
+    const lower = normalizeName(agentName);
+    return AGENTS.find(agent => normalizeName(agent.name) === lower)?.model || "";
+  }
+
+  _modelThrottleSpec(agent, resolvedModel) {
+    if (!MODEL_CONCURRENCY.size) return null;
+    const model = resolvedModel || this._agentModel(agent);
+    const normalizedModel = normalizeName(model);
+    const provider = this._modelProvider(normalizedModel);
+    const exact = MODEL_CONCURRENCY.get(normalizedModel);
+    if (exact) return { key: normalizedModel, limit: exact };
+    const providerLimit = provider ? MODEL_CONCURRENCY.get(provider) : null;
+    if (providerLimit) return { key: provider, limit: providerLimit };
+    const defaultLimit = MODEL_CONCURRENCY.get("default");
+    return defaultLimit ? { key: "default", limit: defaultLimit } : null;
+  }
+
+  _jobsForThrottleKey(key) {
+    if (!key) return [];
+    return [...this._jobs.values()].filter(job => job.throttleKey === key);
+  }
+
+  _activeThrottleCount(key) {
+    return this._jobsForThrottleKey(key).filter(job => job.slotAcquired && !job.submitQueued).length;
+  }
+
+  _queuedThrottleJobs(key) {
+    return this._jobsForThrottleKey(key)
+      .filter(job => job.submitQueued)
+      .sort((a, b) => (a.queuedAt || a.createdAt || 0) - (b.queuedAt || b.createdAt || 0));
+  }
+
+  _queuePosition(job) {
+    if (!job?.submitQueued || !job.throttleKey) return null;
+    const queue = this._queuedThrottleJobs(job.throttleKey);
+    const index = queue.findIndex(candidate => candidate.id === job.id);
+    return index === -1 ? null : index + 1;
+  }
+
+  _hasQueuedJobs() {
+    return [...this._jobs.values()].some(job => job.submitQueued);
+  }
+
+  _markJobQueued(job, msgBody) {
+    const now = Date.now();
+    job.submitDone = false;
+    job.submitQueued = true;
+    job.queuedAt = job.queuedAt || now;
+    job.pendingMsgBody = msgBody;
+    job.lastProgressAt = job.lastProgressAt || now;
+    this._updateJobProgress(job, {
+      phase: "queued",
+      message_count: 0,
+      assistant_count: 0,
+      tool_part_count: 0,
+      latest_assistant_index: -1,
+      latest_assistant_complete: false,
+      latest_assistant_tool_call_turn: false,
+      latest_assistant_finish_reason: "",
+      latest_assistant_text_chars: 0,
+      latest_assistant_reasoning_chars: 0,
+      last_poll_at: null,
+    });
+  }
+
+  _startJobSubmission(job, msgBody) {
+    job.submitQueued = false;
+    job.pendingMsgBody = null;
+    job.startedAt = Date.now();
+    if (job.throttleKey) job.slotAcquired = true;
+    this._beginMessageSubmit(job, msgBody);
+    this._trackActiveJob(job);
+  }
+
+  _queueOrStartJob(job, msgBody) {
+    if (!job.throttleKey || !job.throttleLimit) {
+      this._startJobSubmission(job, msgBody);
+      return;
+    }
+
+    if (this._activeThrottleCount(job.throttleKey) < job.throttleLimit) {
+      this._startJobSubmission(job, msgBody);
+      return;
+    }
+
+    this._markJobQueued(job, msgBody);
+    this._trackActiveJob(job);
+    this._scheduleQueueDrain();
+  }
+
+  _tryStartQueuedJobs() {
+    if (!this._hasQueuedJobs()) return;
+    for (const job of [...this._jobs.values()].filter(j => j.submitQueued).sort((a, b) => (a.queuedAt || a.createdAt || 0) - (b.queuedAt || b.createdAt || 0))) {
+      if (!job.throttleKey || !job.throttleLimit || !job.pendingMsgBody) continue;
+      if (this._activeThrottleCount(job.throttleKey) >= job.throttleLimit) continue;
+      log(`Starting queued opencode job ${job.id} for ${job.throttleKey}`);
+      this._startJobSubmission(job, job.pendingMsgBody);
+    }
+    if (this._hasQueuedJobs()) this._scheduleQueueDrain();
+  }
+
+  _scheduleQueueDrain(delayMs = POLL_INTERVAL) {
+    if (this._queueDrainTimer || !this._hasQueuedJobs()) return;
+    const delay = Math.max(20, Math.min(delayMs, 2_000));
+    this._queueDrainTimer = setTimeout(() => {
+      this._queueDrainTimer = null;
+      this._drainQueuedJobs().catch(error => log(`Queue drain failed: ${error.message}`));
+    }, delay);
+    this._queueDrainTimer.unref?.();
+  }
+
+  async _drainQueuedJobs() {
+    if (!this._hasQueuedJobs()) return;
+    const active = [...this._jobs.values()].filter(job => job.slotAcquired && !job.submitQueued && !job.pollingPromise);
+    const pollBudget = Math.max(20, Math.min(500, POLL_INTERVAL, API_TIMEOUT));
+    await Promise.all(active.map(job => this._pollSession(job, {
+      maxWaitMs: pollBudget,
+      deleteOnComplete: true,
+    })));
+    this._tryStartQueuedJobs();
   }
 
   _modelID(model) {
@@ -902,17 +1077,21 @@ class OpencodeHub {
           phase: "submitted_waiting_for_messages",
         });
         job.submitResult = result;
+        this._saveState();
         return result;
       })
       .catch((error) => {
         job.submitDone = true;
         job.submitCompletedAt = Date.now();
         job.submitError = error;
+        job.slotAcquired = false;
         this._updateJobProgress(job, {
           ...(job.progress || {}),
           phase: "submit_error",
         });
         log(`Message submit failed for session ${job.sid}: ${error.message}`);
+        this._saveState();
+        this._tryStartQueuedJobs();
         return null;
       });
   }
@@ -1012,6 +1191,7 @@ class OpencodeHub {
   }
 
   _progressPhase(job, latestAssistant, messageCount) {
+    if (job.submitQueued) return "queued";
     if (!job.submitDone && messageCount === 0) return "submitting";
     if (job.submitError && messageCount === 0) return "submit_error";
     if (messageCount === 0) return "waiting_for_messages";
@@ -1088,6 +1268,7 @@ class OpencodeHub {
   }
 
   _isStaleTimedOut(job) {
+    if (job.submitQueued) return false;
     if (!STALE_TIMEOUT_MS) return false;
     const { lastActivityAge } = this._jobProgressStats(job);
     return lastActivityAge >= STALE_TIMEOUT_MS;
@@ -1095,7 +1276,7 @@ class OpencodeHub {
 
   _formatProgressLines(job, result = {}) {
     const { progress, lastActivityAge, lastPollAge } = this._jobProgressStats(job);
-    return [
+    const lines = [
       `elapsed_ms: ${Math.max(0, Math.round(result.elapsed || 0))}`,
       `phase: ${progress.phase || (job.submitDone ? "waiting_for_messages" : "submitting")}`,
       `last_progress_ms_ago: ${lastActivityAge}`,
@@ -1111,6 +1292,15 @@ class OpencodeHub {
       `latest_assistant_text_chars: ${progress.latest_assistant_text_chars || 0}`,
       `latest_assistant_reasoning_chars: ${progress.latest_assistant_reasoning_chars || 0}`,
     ];
+    if (job.throttleKey && job.throttleLimit) {
+      lines.push(`concurrency_key: ${job.throttleKey}`);
+      lines.push(`concurrency_limit: ${job.throttleLimit}`);
+      lines.push(`concurrency_active: ${this._activeThrottleCount(job.throttleKey)}`);
+      if (job.submitQueued) {
+        lines.push(`queue_position: ${this._queuePosition(job) || "unknown"}`);
+      }
+    }
+    return lines;
   }
 
   _formatProgressNotes(job) {
@@ -1119,13 +1309,16 @@ class OpencodeHub {
     if (job.lastPollError) {
       lines.push(`last_poll_error: ${job.lastPollError}`);
     }
+    if (job.submitQueued) {
+      lines.push("progress_note: queued by OPENCODE_MODEL_CONCURRENCY; waiting for a provider/model slot.");
+    }
     if (progress.phase === "tool_call_complete_waiting_for_followup") {
       lines.push("progress_note: latest assistant turn completed with tool calls; waiting for follow-up assistant text.");
     }
     if (progress.phase === "receiving_reasoning") {
       lines.push("progress_note: latest assistant is streaming reasoning; final visible text may arrive later.");
     }
-    if (lastActivityAge >= PROGRESS_STALE_MS) {
+    if (!job.submitQueued && lastActivityAge >= PROGRESS_STALE_MS) {
       lines.push(`stale_warning: no session progress for ${lastActivityAge}ms`);
     }
     if (this._isStaleTimedOut(job)) {
@@ -1213,6 +1406,7 @@ class OpencodeHub {
       this._pruneCompletedJobs();
     }
     this._saveState();
+    this._tryStartQueuedJobs();
   }
 
   async _createOpencodeJob(agent, model, prompt, directory, context = "cwd") {
@@ -1222,30 +1416,31 @@ class OpencodeHub {
     const session = await this._api("POST", "/session", { title: `opencode-mcp: ${agent || model || "chat"}` }, { directory: dir });
     const sid = session.id;
 
-    // Message body: agent/model/parts live here per SessionPromptData schema
-    const msgBody = {
-      parts: [{ type: "text", text: prompt }],
-    };
-    if (agent) msgBody.agent = agent;
+    let resolvedModel = null;
     if (model) {
-      const resolvedModel = this._resolveModelAlias(model);
+      resolvedModel = this._resolveModelAlias(model);
       log(`Resolved model "${model}" -> "${resolvedModel}"`);
-      msgBody.model = this._parseModel(resolvedModel);
     }
+    // Message body: agent/model/parts live here per SessionPromptData schema
+    const msgBody = this._buildMessageBody(agent, resolvedModel, prompt);
+    const throttle = this._modelThrottleSpec(agent, resolvedModel);
 
     const job = {
       id: sid,
       sid,
       agent: agent || null,
       model: model || null,
+      resolvedModel,
       prompt,
       directory: dir,
       createdAt: Date.now(),
       last: "",
       lastMessageCount: 0,
+      throttleKey: throttle?.key || null,
+      throttleLimit: throttle?.limit || null,
+      slotAcquired: false,
     };
-    this._beginMessageSubmit(job, msgBody);
-    this._trackActiveJob(job);
+    this._queueOrStartJob(job, msgBody);
     return job;
   }
 
@@ -1272,6 +1467,24 @@ class OpencodeHub {
   }
 
   async _pollSession(job, options = {}) {
+    if (job.pollingPromise) {
+      return {
+        status: "running",
+        elapsed: Math.max(0, Date.now() - (job.createdAt || Date.now())),
+        last: job.last || "",
+        reason: "poll_in_progress",
+      };
+    }
+    const poll = this._pollSessionImpl(job, options);
+    job.pollingPromise = poll;
+    try {
+      return await poll;
+    } finally {
+      if (job.pollingPromise === poll) job.pollingPromise = null;
+    }
+  }
+
+  async _pollSessionImpl(job, options = {}) {
     const sid = job.sid || job.id;
     const prompt = job.prompt || "";
     const maxWaitMs = this._clampedWaitMs(options.maxWaitMs);
@@ -1284,6 +1497,14 @@ class OpencodeHub {
     let completionSignalSeen = false;
     const remainingToolMs = () => TOOL_TIMEOUT > 0 ? TOOL_TIMEOUT - totalElapsed() : Number.POSITIVE_INFINITY;
     log(`Polling session ${sid} (max sync ${maxWaitMs}ms, max total ${TOOL_TIMEOUT}ms)...`);
+
+    if (job.submitQueued) {
+      this._tryStartQueuedJobs();
+      if (job.submitQueued) {
+        this._scheduleQueueDrain();
+        return { status: "running", elapsed: totalElapsed(), last, reason: "queued" };
+      }
+    }
 
     if (maxWaitMs <= 0) {
       return { status: "running", elapsed: totalElapsed(), last, reason: "no_wait" };
@@ -1449,7 +1670,7 @@ class OpencodeHub {
       JSON.stringify({ tool: "opencode_job", arguments: { action: "status", job_id: job.id, wait_ms: suggestedWaitMs } }),
     ];
     if (!job.submitDone) {
-      lines.splice(4, 0, "submit_status: pending");
+      lines.splice(4, 0, `submit_status: ${job.submitQueued ? "queued" : "pending"}`);
     }
     if (result.last) {
       lines.push("", "Latest partial output:", result.last.slice(0, 4000));
@@ -1467,9 +1688,14 @@ class OpencodeHub {
       age_ms: Date.now() - job.createdAt,
       has_partial: !!job.last,
       submit_pending: !job.submitDone,
+      submit_queued: !!job.submitQueued,
       phase: job.progress?.phase || (job.submitDone ? "waiting_for_messages" : "submitting"),
+      concurrency_key: job.throttleKey || null,
+      concurrency_limit: job.throttleLimit || null,
+      concurrency_active: job.throttleKey ? this._activeThrottleCount(job.throttleKey) : null,
+      queue_position: job.submitQueued ? this._queuePosition(job) : null,
       last_progress_ms_ago: Math.max(0, Date.now() - (job.progress?.last_progress_at || job.lastProgressAt || job.createdAt)),
-      stale: Math.max(0, Date.now() - (job.progress?.last_progress_at || job.lastProgressAt || job.createdAt)) >= PROGRESS_STALE_MS,
+      stale: !job.submitQueued && Math.max(0, Date.now() - (job.progress?.last_progress_at || job.lastProgressAt || job.createdAt)) >= PROGRESS_STALE_MS,
       message_count: job.progress?.message_count || 0,
       assistant_count: job.progress?.assistant_count || 0,
       tool_part_count: job.progress?.tool_part_count || 0,
@@ -1484,7 +1710,10 @@ class OpencodeHub {
   }
 
   async _jobToolCall(action, jobId, waitMs) {
-    if (action === "list") return this._formatJobList();
+    if (action === "list") {
+      this._tryStartQueuedJobs();
+      return this._formatJobList();
+    }
     if (!jobId) return "Provide job_id for status or cancel.";
     this._pruneCompletedJobs();
     const job = this._jobs.get(jobId);
@@ -1498,6 +1727,7 @@ class OpencodeHub {
       try { await this._api("DELETE", `/session/${job.sid}`); } catch {}
       this._jobs.delete(job.id);
       this._saveState();
+      this._tryStartQueuedJobs();
       return `Cancelled opencode job: ${job.id}`;
     }
 
@@ -1767,6 +1997,10 @@ class OpencodeHub {
   }
 
   async _stopAll({ cancelJobs = false } = {}) {
+    if (this._queueDrainTimer) {
+      clearTimeout(this._queueDrainTimer);
+      this._queueDrainTimer = null;
+    }
     const preserveActiveJobs = PRESERVE_JOBS && !cancelJobs && this._jobs.size > 0;
     if (preserveActiveJobs) {
       log(`Preserving ${this._jobs.size} active opencode job(s) across bridge shutdown`);
@@ -1846,11 +2080,15 @@ class OpencodeHub {
 const mcpList = CFG.mcp ? Object.keys(CFG.mcp).filter(k => CFG.mcp[k].enabled !== false) : [];
 const skipSet = new Set((process.env.OPENCODE_MCP_SKIP || "").split(",").map(s => s.trim()).filter(Boolean));
 const activeMcps = mcpList.filter(n => !skipSet.has(n));
+const modelConcurrencyText = MODEL_CONCURRENCY.size
+  ? [...MODEL_CONCURRENCY.entries()].map(([key, limit]) => `${key}=${limit}`).join(", ")
+  : "unlimited";
 
 console.error(`opencode-mcp v${VERSION} — MCP hub`);
 console.error(`  opencode:      ${OPENCODE_BIN || "(not found; install opencode for model calls)"}`);
 console.error(`  agents:        ${AGENTS.length} found`);
 console.error(`  tool timeout:  ${TOOL_TIMEOUT > 0 ? `${(TOOL_TIMEOUT / 1000).toFixed(0)}s` : "disabled"}`);
+console.error(`  model jobs:    ${modelConcurrencyText}`);
 console.error(`  proxy timeout: ${(PROXY_TIMEOUT / 1000).toFixed(0)}s`);
 console.error(`  proxied MCPs:  ${activeMcps.length > 0 ? activeMcps.join(", ") : "(none)"}`);
 console.error(`  debug:         ${IS_DEBUG ? "on" : "off (set DEBUG=1)"}`);

@@ -1,5 +1,12 @@
 # Changelog
 
+## 5.4.15 (2026-06-11)
+
+- **Codex bridge auto-sync**: `scripts/setup.sh` now detects when Codex is configured to run a copied bridge under `~/.codex/mcp-servers/` and refreshes that copy during install/update, preventing installed-version drift.
+- **Installer controls**: Added `OPENCODE_MCP_AUTO_SYNC_CODEX_BRIDGE=0` to disable copied-bridge auto-sync while preserving the explicit `OPENCODE_MCP_CODEX_BRIDGE_PATH` override for custom paths.
+- **Provider concurrency queueing**: Added optional `OPENCODE_MODEL_CONCURRENCY` caps so providers such as DeepSeek can be limited locally and excess jobs stay pollable in a queued phase until a slot opens.
+- **Tests**: Added coverage for provider concurrency queueing and kept the missing-session cleanup regression passing.
+
 ## 5.4.14 (2026-06-09)
 
 - **Missing session cleanup**: `opencode_job status` now treats backend `404/410` message polls as terminal `missing_session` results, removes the job from the active list, and caches the diagnostic instead of leaving durable job state orphaned.

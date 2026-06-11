@@ -16,6 +16,7 @@ Environment:
   OPENCODE_MCP_DIR                Install directory (default: \$HOME/.opencode-mcp)
   OPENCODE_MCP_FORCE=1            Reinstall even when the target version is already installed
   OPENCODE_MCP_CODEX_BRIDGE_PATH  Optional extra copied bridge path to sync after install
+  OPENCODE_MCP_AUTO_SYNC_CODEX_BRIDGE=0 disables auto-sync for copied Codex bridges
   OPENCODE_BIN                    Optional opencode binary path hint printed for users
 EOF
 }
@@ -56,6 +57,61 @@ read_installed_version() {
   fi
 }
 
+codex_config_path() {
+  echo "${CODEX_HOME:-$HOME/.codex}/config.toml"
+}
+
+expand_user_path() {
+  case "$1" in
+    "~/"*) echo "$HOME/${1#\~/}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+detect_codex_bridge_path() {
+  local config
+  config=$(codex_config_path)
+  if [ ! -f "$config" ]; then
+    return
+  fi
+
+  awk '
+    /^\[mcp_servers\.opencode-mcp\]/ { in_block = 1; next }
+    /^\[/ && in_block { in_block = 0 }
+    in_block && /^[[:space:]]*args[[:space:]]*=/ { print; exit }
+  ' "$config" | sed -n 's/.*\["\([^"]*\)".*/\1/p' | head -1
+}
+
+codex_bridge_sync_path() {
+  if [ -n "${OPENCODE_MCP_CODEX_BRIDGE_PATH:-}" ]; then
+    expand_user_path "$OPENCODE_MCP_CODEX_BRIDGE_PATH"
+    return
+  fi
+
+  if echo "${OPENCODE_MCP_AUTO_SYNC_CODEX_BRIDGE:-1}" | grep -qiE '^(0|false|off|no)$'; then
+    return
+  fi
+
+  local detected install_src codex_mcp_dir
+  detected=$(detect_codex_bridge_path || true)
+  if [ -z "$detected" ]; then
+    return
+  fi
+
+  detected=$(expand_user_path "$detected")
+  install_src="$INSTALL_DIR/src/index.mjs"
+  if [ "$detected" = "$install_src" ]; then
+    return
+  fi
+
+  codex_mcp_dir="${CODEX_HOME:-$HOME/.codex}/mcp-servers"
+  case "$detected" in
+    "$codex_mcp_dir"/*)
+      echo "$detected"
+      ;;
+  esac
+}
+
 print_next_steps() {
   echo ""
   info "$1"
@@ -84,7 +140,9 @@ print_next_steps() {
 }
 
 sync_copied_bridge() {
-  if [ -z "${OPENCODE_MCP_CODEX_BRIDGE_PATH:-}" ]; then
+  local bridge_path
+  bridge_path=$(codex_bridge_sync_path || true)
+  if [ -z "$bridge_path" ]; then
     return
   fi
 
@@ -93,10 +151,10 @@ sync_copied_bridge() {
     exit 1
   fi
 
-  info "Syncing copied bridge to $OPENCODE_MCP_CODEX_BRIDGE_PATH"
-  mkdir -p "$(dirname "$OPENCODE_MCP_CODEX_BRIDGE_PATH")"
-  cp "$INSTALL_DIR/src/index.mjs" "$OPENCODE_MCP_CODEX_BRIDGE_PATH"
-  chmod +x "$OPENCODE_MCP_CODEX_BRIDGE_PATH" 2>/dev/null || true
+  info "Syncing copied Codex bridge to $bridge_path"
+  mkdir -p "$(dirname "$bridge_path")"
+  cp "$INSTALL_DIR/src/index.mjs" "$bridge_path"
+  chmod +x "$bridge_path" 2>/dev/null || true
   ok "Copied bridge synced"
 }
 
